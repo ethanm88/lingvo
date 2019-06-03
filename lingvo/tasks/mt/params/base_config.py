@@ -20,14 +20,16 @@ from __future__ import print_function
 
 import math
 
+from lingvo.core import attention
 from lingvo.core import layers
-from lingvo.core import lr_schedule
 from lingvo.core import optimizer
 from lingvo.core import py_utils
+from lingvo.core import rnn_cell
+from lingvo.core import rnn_layers
+from lingvo.core import schedule
 from lingvo.tasks.mt import decoder
 from lingvo.tasks.mt import encoder
 from lingvo.tasks.mt import input_generator
-from lingvo.tasks.mt import model
 
 
 def InitTrainDatasetParams(vocab_size=None, params=None):
@@ -126,7 +128,8 @@ def InitTransformerTrainBuckets(params):
   return params
 
 
-def SetupTransformerParams(name,
+def SetupTransformerParams(p,
+                           name,
                            vocab_size,
                            model_dim,
                            hidden_dim,
@@ -139,10 +142,16 @@ def SetupTransformerParams(name,
                            atten_dropout_prob=0.0,
                            relu_dropout_prob=0.0,
                            label_smoothing_uncertainty=0.1,
-                           is_transparent=False):
+                           is_transparent=False,
+                           activation='RELU',
+                           add_unnormalized_residuals=False,
+                           atten_hidden_dim=0,
+                           num_encoder_layers=None,
+                           num_decoder_layers=None):
   """Common model setup for different transformer models.
 
   Args:
+    p: The initial params object to modify.
     name: An identifier for an instance of a transformer model.
     vocab_size: an integer representing the size of the vocabulary, probably
          16000 or 32000.
@@ -166,31 +175,40 @@ def SetupTransformerParams(name,
          applied
     is_transparent: If set, decoder layers attend to weighted combinations of
         encoder layers.
+    activation: Non-linearity for feed-forward layers.
+    add_unnormalized_residuals: If set, uses un-normalized residuals in
+        TransformerAttentionLayer
+    atten_hidden_dim: Explicitly set attention hidden dim.
+    num_encoder_layers: to set a different number of layers for the encoder.
+    num_decoder_layers: to set a different number of layers for the decoder.
 
   Returns:
     A Params object containing the parameters that specify a transformer model
     (Vaswani 2017)
 
   """
-  p = model.TransformerModel.Params()
   p.name = name
 
   # Transformer encoder and decoder setup
+  num_encoder_layers = num_encoder_layers or num_layers
+  num_decoder_layers = num_decoder_layers or num_layers
   p.encoder = SetupTransformerEncoder(
-      model_dim, vocab_size, num_layers, num_heads, hidden_dim,
+      model_dim, vocab_size, num_encoder_layers, num_heads, hidden_dim,
       residual_dropout_prob, input_dropout_prob, atten_dropout_prob,
-      relu_dropout_prob, is_transparent)
+      relu_dropout_prob, is_transparent, activation, add_unnormalized_residuals,
+      atten_hidden_dim)
   p.decoder = SetupTransformerDecoder(
-      model_dim, vocab_size, num_layers, num_heads, hidden_dim,
+      model_dim, vocab_size, num_decoder_layers, num_heads, hidden_dim,
       residual_dropout_prob, input_dropout_prob, atten_dropout_prob,
-      relu_dropout_prob, label_smoothing_uncertainty, is_transparent)
+      relu_dropout_prob, label_smoothing_uncertainty, is_transparent,
+      activation, add_unnormalized_residuals, atten_hidden_dim)
 
   p.train.Set(
       learning_rate=learning_rate,
       optimizer=optimizer.Adam.ParamsB(),
       clip_gradient_norm_to_value=0.0,
       grad_norm_to_clip_to_zero=0.0,
-      lr_schedule=lr_schedule.TransformerLearningRateSchedule.Params().Set(
+      lr_schedule=schedule.TransformerLearningRateSchedule.Params().Set(
           warmup_steps=warmup_steps, worker_replicas=1, model_dim=model_dim))
 
   p.eval.samples_per_summary = 12000
@@ -207,7 +225,10 @@ def SetupTransformerDecoder(model_dim,
                             atten_dropout_prob=0.0,
                             relu_dropout_prob=0.0,
                             label_smoothing_uncertainty=0.1,
-                            is_transparent=False):
+                            is_transparent=False,
+                            activation='RELU',
+                            add_unnormalized_residuals=False,
+                            atten_hidden_dim=0):
   """Common setup for transformer model decoder."""
   disable_vn = py_utils.VariationalNoiseParams(1.0, False, False)
   default_params_init = py_utils.WeightInit.Xavier(1.0)
@@ -238,6 +259,8 @@ def SetupTransformerDecoder(model_dim,
       residual_dropout_prob=residual_dropout_prob,
       atten_dropout_prob=atten_dropout_prob,
       params_init=default_params_init,
+      add_unnormalized_input=add_unnormalized_residuals,
+      atten_hidden_dim=atten_hidden_dim,
       vn=disable_vn)
 
   decoder_params.trans_tpl.tr_atten_tpl.atten_tpl.Set(
@@ -252,7 +275,8 @@ def SetupTransformerDecoder(model_dim,
       residual_dropout_prob=residual_dropout_prob,
       relu_dropout_prob=relu_dropout_prob,
       params_init=default_params_init,
-      vn=disable_vn)
+      vn=disable_vn,
+      activation=activation)
 
   decoder_params.softmax.Set(
       num_classes=vocab_size,
@@ -280,7 +304,10 @@ def SetupTransformerEncoder(model_dim,
                             input_dropout_prob=0.0,
                             atten_dropout_prob=0.0,
                             relu_dropout_prob=0.0,
-                            is_transparent=False):
+                            is_transparent=False,
+                            activation='RELU',
+                            add_unnormalized_residuals=False,
+                            atten_hidden_dim=0):
   """Common setup for transformer model encoder.
 
   Args:
@@ -295,6 +322,10 @@ def SetupTransformerEncoder(model_dim,
    atten_dropout_prob: used in attention layer.
    relu_dropout_prob: used in transformer feedforward layer.
    is_transparent: if set, outputs a merger of embeddings and layer outputs.
+   activation: Non-linearity for feed-forward layers.
+   add_unnormalized_residuals: If set, uses un-normalized residuals in
+     TransformerAttentionLayer
+   atten_hidden_dim: Explicitly set attention hidden dim.
 
   Returns:
    Encoder params.
@@ -328,6 +359,8 @@ def SetupTransformerEncoder(model_dim,
       residual_dropout_prob=residual_dropout_prob,
       atten_dropout_prob=atten_dropout_prob,
       params_init=default_params_init,
+      add_unnormalized_input=add_unnormalized_residuals,
+      atten_hidden_dim=atten_hidden_dim,
       vn=disable_vn)
 
   encoder_params.transformer_stack.transformer_tpl.tr_atten_tpl.atten_tpl.Set(
@@ -342,9 +375,138 @@ def SetupTransformerEncoder(model_dim,
       residual_dropout_prob=residual_dropout_prob,
       relu_dropout_prob=relu_dropout_prob,
       params_init=default_params_init,
-      vn=disable_vn)
+      vn=disable_vn,
+      activation=activation)
 
   if is_transparent:
     encoder_params.transformer_stack.is_transparent = True
 
   return encoder_params
+
+
+def SetupRNMTParams(p,
+                    name,
+                    vocab_size,
+                    embedding_dim,
+                    hidden_dim,
+                    num_heads,
+                    num_encoder_layers,
+                    num_decoder_layers,
+                    learning_rate,
+                    lr_warmup_steps,
+                    lr_decay_start,
+                    lr_decay_end,
+                    lr_min,
+                    atten_dropout_prob,
+                    residual_dropout_prob,
+                    ls_uncertainty,
+                    l2_regularizer_weight,
+                    is_transparent=False,
+                    num_hyps_per_beam=16,
+                    adam_beta1=0.9,
+                    adam_beta2=0.999,
+                    adam_epsilon=8e-07):
+  """Creates RNMT+ params common to all datasets.
+
+  Args:
+    p: The initial params object to modify.
+    name: A descriptive name for your model.
+    vocab_size: size of the vocabulary. Probably 32000 or 16000.
+    embedding_dim: Dimension of token embeddings.
+    hidden_dim: LSTM cell size.
+    num_heads: number of attention heads.
+    num_encoder_layers: Number of layers in the encoder.
+    num_decoder_layers: Number of layers in the decoder.
+    learning_rate: Optimizer learning rate.
+    lr_warmup_steps: Warm-up steps for the optimizer.
+    lr_decay_start: Learning rate exponential decay starting step.
+    lr_decay_end: Learning rate exponential decay end step.
+    lr_min: Minimum learning rate (ratio with initial learning rate).
+    atten_dropout_prob: Dropout for the attention.
+    residual_dropout_prob: Dropout for residual layers.
+    ls_uncertainty: Label smoothing uncertainty.
+    l2_regularizer_weight: Weight for l2 regularization on parameters.
+    is_transparent: If set, decoder attends to weighted combination of encoder
+      layers.
+    num_hyps_per_beam: Number of hyps to keep per source sequence.
+    adam_beta1: Beta-1 parameter of Adam optimizer.
+    adam_beta2: Beta-2 parameter of Adam optimizer.
+    adam_epsilon: Epsilon parameter of Adam optimizer.
+
+  Returns:
+    a Params() object specifying the RNMT+ Parameters.
+  """
+
+  # TODO(orhanf): add transparent connections.
+  del is_transparent
+
+  p.name = name
+
+  default_params_init = py_utils.WeightInit.Uniform(0.04)
+  rnn_cell_tpl = rnn_cell.LayerNormalizedLSTMCellSimple.Params().Set(
+      num_output_nodes=hidden_dim,
+      output_nonlinearity=False,
+      params_init=default_params_init)
+
+  # RNMT+ encoder setup.
+  p.encoder = encoder.MTEncoderBiRNN.Params().Set(
+      num_lstm_layers=num_encoder_layers,
+      lstm_cell_size=hidden_dim,
+      encoder_out_dim=hidden_dim,
+      lstm_tpl=rnn_cell_tpl.Copy(),
+      dropout_prob=residual_dropout_prob)
+  p.encoder.emb.embedding_dim = embedding_dim
+  p.encoder.emb.vocab_size = vocab_size
+
+  # RNMT+ decoder setup.
+  p.decoder = decoder.MTDecoderV1.Params().Set(
+      rnn_layers=num_decoder_layers,
+      rnn_cell_tpl=rnn_cell_tpl.Copy(),
+      atten_rnn_cell_tpl=rnn_cell_tpl.Copy(),
+      dropout_prob=residual_dropout_prob,
+      attention=attention.MultiHeadedAttention.Params().Set(
+          source_dim=hidden_dim,
+          hidden_dim=hidden_dim,
+          query_dim=hidden_dim,
+          context_dim=hidden_dim,
+          num_attention_heads=num_heads,
+          inner_atten_params=attention.AdditiveAttention.Params(),
+          use_source_vec_as_attention_value=True,
+          enable_ctx_pre_proj=False,
+          enable_query_proj=True,
+          atten_dropout_prob=atten_dropout_prob,
+          atten_dropout_deterministic=True),
+      atten_rnn_cls=rnn_layers.FRNNWithAttention,
+      feed_attention_context_vec_to_softmax=True,
+      label_smoothing=layers.UniformLabelSmoother.Params().Set(
+          num_classes=vocab_size, uncertainty=ls_uncertainty))
+  p.decoder.emb.vocab_size = vocab_size
+  p.decoder.emb.embedding_dim = embedding_dim
+  p.decoder.softmax.num_classes = vocab_size
+  p.decoder.source_dim = hidden_dim
+
+  # Inference related.
+  p.decoder.beam_search.num_hyps_per_beam = num_hyps_per_beam
+
+  # Optimization setup.
+  learning_rate_schedule = (
+      schedule.LinearRampupExponentialDecayScaledByNumSplitSchedule.Params()
+      .Set(
+          warmup=lr_warmup_steps,
+          decay_start=lr_decay_start,
+          decay_end=lr_decay_end,
+          min=lr_min))
+  p.train.Set(
+      l2_regularizer_weight=l2_regularizer_weight,
+      grad_norm_tracker=layers.GradNormTracker.Params().Set(
+          name='gradient_norm_tracker'),
+      learning_rate=learning_rate,
+      lr_schedule=learning_rate_schedule,
+      grad_norm_to_clip_to_zero=100000.0,
+      optimizer=optimizer.Adam.Params().Set(
+          beta1=adam_beta1, beta2=adam_beta2, epsilon=adam_epsilon),
+  )
+
+  # Evaluation related
+  p.eval.samples_per_summary = 12000
+  return p

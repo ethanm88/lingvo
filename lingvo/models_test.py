@@ -26,51 +26,19 @@ from lingvo import model_registry
 # Import DummyModel
 from lingvo import model_registry_test
 # pylint: enable=unused-import
-from lingvo.core import base_model
-from lingvo.core import base_input_generator
+from lingvo import models_test_helper
 from lingvo.core import base_model_params
 
 
-class ModelsTest(tf.test.TestCase):
+class ModelsTest(models_test_helper.BaseModelsTest):
 
   def testGetModelParamsClass(self):
     cls = model_registry.GetClass('test.DummyModel')
     self.assertTrue(issubclass(cls, base_model_params.SingleTaskModelParams))
 
-  def _testOneModelParams(self, name):
-    cls = model_registry.GetClass(name)
-    p = cls.Model()
-    self.assertTrue(issubclass(p.cls, base_model.BaseModel))
-    self.assertTrue(p.model is not None)
-    for dataset in ('Train', 'Dev', 'Test'):
-      input_p = cls.GetDatasetParams(dataset)
-      if issubclass(p.cls, base_model.SingleTaskModel):
-        self.assertTrue(
-            issubclass(input_p.cls, base_input_generator.BaseInputGenerator),
-            'Error in %s' % dataset)
-        if (dataset != 'Train') and issubclass(
-            input_p.cls, base_input_generator.BaseSequenceInputGenerator) and (
-                input_p.num_samples != 0):
-          self.assertEquals(
-              input_p.num_batcher_threads, 1,
-              'num_batcher_threads too large in %s. Decoder '
-              'or eval runs over this set might not span '
-              'exactly one epoch.' % dataset)
-      else:
-        self.assertTrue(issubclass(p.cls, base_model.MultiTaskModel))
-        for _, v in input_p.IterParams():
-          self.assertTrue(
-              issubclass(v.cls, base_input_generator.BaseInputGenerator),
-              'Error in %s' % dataset)
 
+ModelsTest.CreateTestMethodsForAllRegisteredModels(model_registry)
 
-# Programmatically define test methods for each model in the global registry.
-for model_name in sorted(model_registry.GetAllRegisteredClasses().keys()):
-
-  def test(self, name=model_name):
-    self._testOneModelParams(name)
-
-  setattr(ModelsTest, 'testModelParams_%s' % model_name, test)
 
 if __name__ == '__main__':
   tf.test.main()

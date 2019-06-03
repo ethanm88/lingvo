@@ -23,9 +23,9 @@ import os
 from lingvo import model_registry
 from lingvo.core import base_model_params
 from lingvo.core import layers
-from lingvo.core import lr_schedule
 from lingvo.core import optimizer
 from lingvo.core import py_utils
+from lingvo.core import schedule
 from lingvo.core import tokenizers
 from lingvo.tasks.lm import input_generator as lm_inp
 from lingvo.tasks.lm import layers as lm_layers
@@ -135,7 +135,7 @@ class WordLevelOneBwdsBase(base_model_params.SingleTaskModelParams):
     # threshold.
     tp.learning_rate = 0.2
     tp.lr_schedule = (
-        lr_schedule.PiecewiseConstantLearningRateSchedule.Params().Set(
+        schedule.PiecewiseConstantLearningRateSchedule.Params().Set(
             boundaries=[], values=[1.0]))
     tp.l2_regularizer_weight = None  # No regularization.
     tp.optimizer = optimizer.Adagrad.Params()
@@ -173,3 +173,57 @@ class WordLevelOneBwdsSimpleSampledSoftmaxTiny(
   NUM_SAMPLED = 8
   NUM_SOFTMAX_SHARDS = 8
   RNN_STATE_DIM = 32
+
+
+# Try the following params and deploy 8 accelerators to train a bigger model
+# EMBEDDING_DIM = 2048
+# GPUS = 8  # For example, on 8 accelerator, each of which has 16G mem.
+# SPLITS = [10 + 12 * i for i in range(GPUS - 1)]
+# LAYERS = SPLITS[-1]  #4.9B params
+# BATCH_SIZE = 32
+# NUM_MICRO_BATCHES = 32
+@model_registry.RegisterSingleTaskModel
+class OneBWdsGPipeTransformer(WordLevelOneBwdsBase):
+  """LM using gpipe transformer."""
+  EMBEDDING_DIM = 1024
+  BATCH_SIZE = 8
+  MAX_TOKENS = 128  # The max sequence length in one example.
+  LAYERS = 6
+  # GPIPE related params.
+  SPLITS = 1
+  NUM_MICRO_BATCHES = 1
+
+  @classmethod
+  def Train(cls):
+    p = super(OneBWdsGPipeTransformer, cls).Train()
+    p.bucket_upper_bound = [cls.MAX_TOKENS]
+    p.bucket_batch_limit = [cls.BATCH_SIZE]
+    p.fixed_input_shape = True
+    return p
+
+  @classmethod
+  def Task(cls):
+    """Language model on 1bw dataset using gpipe transformer."""
+    p = model.FixedShapeInputLanguageModel.Params()
+    p.eval.samples_per_summary = 0
+    p.name = '1bwds_wpm_level_lm'
+    p.lm = lm_layers.GPipeTransformerLm.CommonParams(
+        model_dim=cls.EMBEDDING_DIM,
+        vocab_size=cls.VOCAB_SIZE,
+        hidden_dim=cls.EMBEDDING_DIM * 4,
+        num_layers=cls.LAYERS,
+        splits=cls.SPLITS,
+        num_micro_batches=cls.NUM_MICRO_BATCHES,
+        num_heads=16,
+        softmax_max_alloc=128 * (2**20),
+        atten_dropout_prob=0.1,
+        residual_dropout_prob=0.1)
+
+    p.train.Set(
+        learning_rate=0.5,
+        optimizer=optimizer.Adam.ParamsA(),
+        clip_gradient_norm_to_value=0.0,
+        grad_norm_to_clip_to_zero=0.0,
+        lr_schedule=schedule.TransformerLearningRateSchedule.Params().Set(
+            warmup_steps=40000, worker_replicas=1, model_dim=cls.EMBEDDING_DIM))
+    return p

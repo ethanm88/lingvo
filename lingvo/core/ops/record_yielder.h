@@ -35,13 +35,46 @@ limitations under the License.
 namespace tensorflow {
 namespace lingvo {
 
+// An interface to iterate sequentially a set of record (Rope).
+class RecordIterator {
+ public:
+  virtual ~RecordIterator() {}
+
+  // Get the next record. If EOF, returns false. Otherwise returns true and
+  // fills in 'key' and 'value'.
+  virtual bool Next(string* key, Rope* value) = 0;
+
+  // Register a method to create a RecordIterator for the 'type_name'.
+  typedef std::function<RecordIterator*(const string&)> FactoryMethod;
+  static bool Register(const string& type_name, FactoryMethod method);
+
+  // As above, but also register a custom method for parsing file_pattern
+  // strings into lists of shards.
+  typedef std::function<Status(const string&, std::vector<std::string>*)>
+      PatternParserMethod;
+  static bool RegisterWithPatternParser(const string& type_name,
+                                        FactoryMethod method,
+                                        PatternParserMethod parser_method);
+
+  // Returns a record iterator for 'filename' of 'type_name'.
+  static RecordIterator* New(const string& type_name, const string& filename);
+
+  // Returns the prefix in a file pattern, or an empty string if not exist.
+  // Example: "tfrecord:data_dir/data.tfrecord" => "tfrecord"
+  static string GetFilePatternPrefix(const string& file_pattern);
+
+  // Parse a file pattern into a list of matching files.
+  static Status ParsePattern(const string& type_name,
+                             const string& file_pattern_list,
+                             std::vector<string>* filenames);
+};
+
 // RecordYielder defines an interface that should be used for producing value
 // records from files in a random order. Most users should use
 // BasicRecordYielder and BasicRecordYielder::New (see example below).
 //
-// RecordYielder guarantees that:
-//   1) all records are yielded within every epoch;
-//   2) the order in which records are yielded are highly randomized.
+// RecordYielder guarantees that the order in which records are yielded are
+// highly randomized.
 //
 // Usage example:
 //   BasicRecordYielder::Options opts;
@@ -62,14 +95,17 @@ class RecordYielder {
  public:
   virtual ~RecordYielder();
 
-  // Yields one 'value'.
-  virtual Status Yield(Rope* value) = 0;
+  // Yields one 'value' and the id of the source.
+  // source_id is useful to specify the source when reading from multiple input
+  // sources. To read from multiple input sources and keep track of the
+  // source id, create a WeightedMixRecordYielder and create a
+  // BasicRecordYielder for each source. Each BasicRecordYielder can be assigned
+  // a source_id, which is assigned to the argument here.
+  // A nullptr can be provided as input for source_id.
+  virtual Status Yield(Rope* value, int* source_id) = 0;
 
   // Stop this yielder and then delete it.
   virtual void Close() = 0;
-
-  // Returns the current epoch number.
-  virtual int64 current_epoch() const = 0;
 };
 
 // BasicRecordYielder is a RecordYielder that implements a main loop and makes
@@ -88,6 +124,8 @@ class BasicRecordYielder : public RecordYielder {
     // The set of files to yield records from.  file_pattern follows:
     // [<type name>:]<glob pattern>, where <type name> must have an
     // associated factory method through registration via New().
+    //
+    // TODO(zhifengc): Document it better the current support format.
     string file_pattern;
 
     // Random seed. It determines how data files are shuffled.
@@ -98,29 +136,34 @@ class BasicRecordYielder : public RecordYielder {
 
     // Uses this many concurrent iterators to iterate through files.
     int32 parallelism = 1;
-  };
 
-  // Register a method to create a RecordYielder for the 'type_name'.
-  typedef std::function<BasicRecordYielder*(const BasicRecordYielder::Options&)>
-      FactoryMethod;
-  static bool Register(const string& type_name, FactoryMethod method);
+    // Source id to be supplied with yield.
+    int32 source_id = 0;
+  };
 
   // Returns a record yielder according to 'opts'. A caller is responsible for
   // calling Close when this yielder is no longer required. A caller shouldn't
   // delete the yielder.
-  static RecordYielder* New(Options opts);
+  static BasicRecordYielder* New(Options opts);
 
-  // Yields one 'value'.
-  Status Yield(Rope* value) override;
+  // Yields one 'value' and 'source_id' from which the value was read.
+  Status Yield(Rope* value, int* source_id) override;
 
   // Stop this yielder and then delete it.
   void Close() override;
 
-  // Returns the current epoch number.
-  int64 current_epoch() const override { return epoch_; }
+  // Returns the current epoch number. Epoch number starts from 1 and reflects
+  // the epoch number of the record returned by the next Yield() call.
+  virtual int64 current_epoch() const {
+    // TODO(tilarids): Use ReaderMutexLock here.
+    MutexLock l(&mu_);
+    return epoch_;
+  }
 
  protected:
   explicit BasicRecordYielder(const Options& opts);
+  explicit BasicRecordYielder();  // USED ONLY FOR TESTS.
+
 
   ~BasicRecordYielder() override;
 
@@ -132,9 +175,7 @@ class BasicRecordYielder : public RecordYielder {
     Notification done;              // Notified when this shard is done.
     Status status;                  // Shard status.
   };
-  virtual void ShardLoop(Shard* shard) = 0;
-  virtual Status MatchFiles(const string& patterns,
-                            std::vector<string>* filenames);
+  void ShardLoop(Shard* shard);
 
   // Returns true iff 's' indicates the yielder should stop.
   bool ShouldFinish(const Status& s);
@@ -146,14 +187,15 @@ class BasicRecordYielder : public RecordYielder {
   typedef BasicRecordYielder ME;
 
   Options opts_;
+  string file_type_;
 
   // Background threads. Owned.
   thread::ThreadPool* thread_;
 
-  // Epoch number.
-  std::atomic<int64> epoch_;
+  mutable Mutex mu_;
 
-  Mutex mu_;
+  // Epoch number.
+  int64 epoch_ GUARDED_BY(mu_);
 
   // Turned to true when the yielder is deleted.
   bool stop_ GUARDED_BY(mu_) = false;
@@ -166,7 +208,7 @@ class BasicRecordYielder : public RecordYielder {
   std::vector<Rope> buf_ GUARDED_BY(mu_);
 
   // True iff we are draining an epoch.
-  bool epoch_end_ = false;
+  bool epoch_end_ GUARDED_BY(mu_) = false;
 
   int64 num_records_yielded_in_epoch_ = 0;
 

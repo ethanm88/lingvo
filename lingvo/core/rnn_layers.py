@@ -18,7 +18,7 @@ from __future__ import division
 from __future__ import print_function
 
 import math
-from six.moves import range
+from six.moves import xrange  # pylint: disable=redefined-builtin
 from six.moves import zip
 import tensorflow as tf
 
@@ -27,7 +27,6 @@ from tensorflow.python.framework import function
 
 from lingvo.core import attention
 from lingvo.core import base_layer
-from lingvo.core import cluster_factory
 from lingvo.core import cudnn_rnn_utils
 from lingvo.core import hyperparams
 from lingvo.core import layers
@@ -53,11 +52,12 @@ def _AssertCellParamsCuDNNCompatible(p_cell):
 def _GeneratePackedInputResetMask(segment_id, is_reverse=False):
   """Generates mask inputs for RNN cells from segment_id.
 
-    Args:
-      segment_id: A tensor of shape [time, batch_size, 1]
-      is_reverse: True if inputs are fed to the RNN in reverse order.
-    Returns:
-      reset_mask - a tensor of shape [time, batch_size, 1]. Set to 0 for samples
+  Args:
+    segment_id: A tensor of shape [time, batch_size, 1].
+    is_reverse: True if inputs are fed to the RNN in reverse order.
+
+  Returns:
+    reset_mask - a tensor of shape [time, batch_size, 1]. Set to 0 for samples
       where state needs to be reset (at example boundaries), and 1 otherwise.
   """
   segment_id_left = segment_id[:-1]
@@ -118,8 +118,8 @@ class RNN(base_layer.BaseLayer):
   def __init__(self, params):
     super(RNN, self).__init__(params)
     p = self.params
-    assert p.packed_input is False, ('Packed inputs are currently not '
-                                     'supported by Static RNN')
+    assert not p.packed_input, ('Packed inputs are currently not supported by '
+                                'Static RNN')
     p.cell.reset_cell_state = p.packed_input
     assert p.sequence_length >= 0
     self.CreateChild('cell', p.cell)
@@ -186,6 +186,12 @@ class StackedRNNBase(base_layer.BaseLayer):
   def Params(cls):
     p = super(StackedRNNBase, cls).Params()
     p.Define('num_layers', 1, 'The number of RNN layers.')
+    p.Define(
+        'num_input_nodes', -1,
+        'If >= 0, overrides cell_tpl.num_input_nodes for the first layer.')
+    p.Define(
+        'num_output_nodes', -1,
+        'If >= 0, overrides cell_tpl.num_output_nodes for the last layer.')
     p.Define('skip_start', 1, 'The first layer start skip connection.')
     p.Define(
         'cell_tpl', rnn_cell.LSTMCellSimple.Params(),
@@ -202,8 +208,8 @@ class StackedRNNBase(base_layer.BaseLayer):
   def __init__(self, params):
     super(StackedRNNBase, self).__init__(params)
     p = self.params
-    assert p.packed_input is False, ('Packed inputs are currently not '
-                                     'supported by Static RNN Base')
+    assert not p.packed_input, ('Packed inputs are currently not supported by '
+                                'Static RNN Base')
 
   def _GetCellTpls(self):
     p = self.params
@@ -223,6 +229,12 @@ class StackedRNNBase(base_layer.BaseLayer):
 class StackedFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
   """An implemention of StackedRNNBase which computes layer-by-layer."""
 
+  @classmethod
+  def Params(cls):
+    p = super(StackedFRNNLayerByLayer, cls).Params()
+    p.Define('rnn_tpl', FRNN.Params(), 'Rnn cell default params.')
+    return p
+
   @base_layer.initializer
   def __init__(self, params):
     super(StackedFRNNLayerByLayer, self).__init__(params)
@@ -231,12 +243,16 @@ class StackedFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
     rnn_params = []
     with tf.name_scope(p.name):
       for (i, cell_tpl) in enumerate(self._GetCellTpls()):
-        params = FRNN.Params()
+        params = p.rnn_tpl.Copy()
         params.packed_input = p.packed_input
         params.allow_implicit_capture = p.allow_implicit_capture
         params.name = 'frnn_%d' % i
         params.cell = cell_tpl.Copy()
         params.cell.name = '%s_%d' % (p.name, i)
+        if p.num_input_nodes > 0 and i == 0:
+          params.cell.num_input_nodes = p.num_input_nodes
+        if p.num_output_nodes > 0 and i == p.num_layers - 1:
+          params.cell.num_output_nodes = p.num_output_nodes
         rnn_params.append(params)
 
     for i in range(len(rnn_params) - 1):
@@ -283,7 +299,9 @@ class StackedFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
       ys, state1.rnn[i] = self.rnn[i].FProp(theta.rnn[i], xs, paddings,
                                             state0.rnn[i])
       ys = self.dropout.FProp(theta.dropout, ys)
-      if p.skip_start >= 0 and i >= p.skip_start:
+      if (p.skip_start >= 0 and i >= p.skip_start and
+          (p.num_input_nodes <= 0 or i != 0) and
+          (p.num_output_nodes <= 0 or i != p.num_layers - 1)):
         ys = self.fns.qadd(ys, xs, qt='residual')
       xs = ys
     return xs, state1
@@ -307,6 +325,10 @@ class StackedBiFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
         rnn_p = cell_tpl.Copy()
         if i > 0:
           rnn_p.num_input_nodes = feature_dim
+        if p.num_input_nodes > 0 and i == 0:
+          rnn_p.num_input_nodes = p.num_input_nodes
+        if p.num_output_nodes > 0 and i == p.num_layers - 1:
+          rnn_p.num_output_nodes = p.num_output_nodes // 2
         frnn_param = BidirectionalFRNN.Params()
         frnn_param.name = 'bidi_rnn_%d' % i
         frnn_param.fwd = rnn_p.Copy().Set(name='f_rnn_%d' % i)
@@ -335,7 +357,9 @@ class StackedBiFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
     for i in range(p.num_layers):
       ys = self.rnn[i].FProp(theta.rnn[i], xs, paddings)
       ys = self.dropout.FProp(theta.dropout, ys)
-      if p.skip_start >= 0 and i >= p.skip_start:
+      if (p.skip_start >= 0 and i >= p.skip_start and
+          (p.num_input_nodes <= 0 or i != 0) and
+          (p.num_output_nodes <= 0 or i != p.num_layers - 1)):
         ys = self.fns.qadd(ys, xs, qt='residual')
       xs = ys
     return xs
@@ -561,8 +585,8 @@ class BidirectionalRNN(base_layer.BaseLayer):
   def __init__(self, params):
     super(BidirectionalRNN, self).__init__(params)
     p = self.params
-    assert p.packed_input is False, ('Packed input is currently not supported '
-                                     'by BiDirectionalRNN')
+    assert not p.packed_input, ('Packed input is currently not supported by '
+                                'BiDirectionalRNN')
     params_forward = p.rnn.Copy()
     params_forward.name = '%s_forward' % p.name
     params_forward.cell = p.fwd.Copy()
@@ -621,9 +645,8 @@ class BidirectionalRNNV2(base_layer.BaseLayer):
   @base_layer.initializer
   def __init__(self, params):
     super(BidirectionalRNNV2, self).__init__(params)
-    assert self.params.packed_input is False, (
-        'Packed input is currently not '
-        'supported by BiDirectionalRNNV2')
+    assert not self.params.packed_input, ('Packed input is currently not '
+                                          'supported by BiDirectionalRNNV2')
     p = BidirectionalRNN.Params()
     p.packed_input = self.params.packed_input
     p.name = '%s_brnn' % self.params.name
@@ -706,8 +729,8 @@ class CuDNNLSTM(base_layer.BaseLayer):
   def __init__(self, params):
     super(CuDNNLSTM, self).__init__(params)
     p = self.params
-    assert self.params.packed_input is False, ('Packed input is currently not '
-                                               'supported by CuDNNLSTM')
+    assert not p.packed_input, ('Packed input is currently not supported by '
+                                'CuDNNLSTM')
     _AssertCellParamsCuDNNCompatible(p.cell)
     if not p.is_eval:
       # Use the cell's name as variable scope such that vars in train and eval
@@ -820,9 +843,8 @@ class BidirectionalNativeCuDNNLSTM(base_layer.BaseLayer):
   def __init__(self, params):
     super(BidirectionalNativeCuDNNLSTM, self).__init__(params)
     p = self.params
-    assert self.params.packed_input is False, (
-        'Packed input is currently not '
-        'supported by BidirectionalNativeCuDNNLSTM')
+    assert not p.packed_input, ('Packed input is currently not supported by '
+                                'BidirectionalNativeCuDNNLSTM')
     assert p.fwd.num_input_nodes == p.bak.num_input_nodes
     assert p.fwd.num_output_nodes == p.bak.num_output_nodes
     _AssertCellParamsCuDNNCompatible(p.fwd)
@@ -956,7 +978,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
     if p.use_zero_atten_state:
       assert p.atten_context_dim > 0, (
           'atten_context_dim needs to be set when '
-          'intializing attention state and context with 0.')
+          'initializing attention state and context with 0.')
     if p.packed_input:
       assert p.use_zero_atten_state, (
           'Packed input is only supported when '
@@ -1045,25 +1067,19 @@ class FRNNWithAttention(base_layer.BaseLayer):
     s_seq_len = tf.shape(src_encs)[0]
 
     zero_atten_state = atten.ZeroAttentionState(s_seq_len, batch_size)
-    state0.step_state = py_utils.NestedMap(
-        global_step=py_utils.GetOrCreateGlobalStep(),
-        time_step=tf.constant(0, dtype=tf.int64))
     if p.use_zero_atten_state:
-      zero_atten_context = tf.zeros(
-          [batch_size, p.atten_context_dim], dtype=src_encs.dtype)
+      zero_atten_context = tf.zeros([batch_size, p.atten_context_dim],
+                                    dtype=py_utils.FPropDtype(p))
       state0.atten = zero_atten_context
       state0.atten_state = zero_atten_state
-      state0.atten_probs = tf.zeros(
-          [batch_size, s_seq_len], dtype=zero_atten_state.dtype)
+      state0.atten_probs = tf.zeros([batch_size, s_seq_len],
+                                    dtype=py_utils.FPropDtype(p))
     else:
       state0.atten, state0.atten_probs, state0.atten_state = (
           atten.ComputeContextVectorWithSource(
-              theta.atten,
-              packed_src,
+              theta.atten, packed_src,
               tf.zeros([batch_size, p.cell.num_output_nodes],
-                       dtype=self.cell.params.dtype),
-              zero_atten_state,
-              step_state=state0.step_state))
+                       dtype=self.cell.params.dtype), zero_atten_state))
     return state0
 
   def reset_atten_state(self, theta, state, inputs):
@@ -1129,8 +1145,8 @@ class FRNNWithAttention(base_layer.BaseLayer):
       state0 = self.zero_state(theta, src_encs, packed_src, batch,
                                zero_atten_state_dim)
     else:
-      assert p.packed_input is False, ('packed input is only supported with '
-                                       'default initial states.')
+      assert not p.packed_input, ('packed input is only supported with default '
+                                  'initial states.')
 
     def CellFn(theta, state0, inputs):
       """Computes one step forward."""
@@ -1139,15 +1155,15 @@ class FRNNWithAttention(base_layer.BaseLayer):
         state0_mod = self.reset_atten_state(theta, state0_mod, inputs)
       else:
         state0_mod = state0
-      state1 = py_utils.NestedMap(step_state=state0_mod.step_state)
+      state1 = py_utils.NestedMap()
+      if rcell.params.inputs_arity == 1:
+        act = [_ConcatLastDim(inputs.act, state0_mod.atten)]
+      else:
+        act = [inputs.act, state0_mod.atten]
       state1.rnn, _ = rcell.FProp(
           theta.rnn, state0_mod.rnn,
           py_utils.NestedMap(
-              act=[_ConcatLastDim(inputs.act, state0_mod.atten)]
-              if rcell.params.inputs_arity == 1 else
-              [inputs.act, state0_mod.atten],
-              padding=inputs.padding,
-              reset_mask=inputs.reset_mask))
+              act=act, padding=inputs.padding, reset_mask=inputs.reset_mask))
 
       state1.atten, state1.atten_probs, state1.atten_state = (
           atten.ComputeContextVectorWithSource(
@@ -1155,9 +1171,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
               theta.packed_src,
               rcell.GetOutput(state1.rnn),
               state0_mod.atten_state,
-              step_state=state0_mod.step_state,
               query_segment_id=tf.squeeze(inputs.segment_id, 1)))
-      state1.step_state.time_step += 1
       return state1, py_utils.NestedMap()
 
     if p.packed_input:
@@ -1167,7 +1181,10 @@ class FRNNWithAttention(base_layer.BaseLayer):
 
     acc_state, final_state = recurrent.Recurrent(
         theta=py_utils.NestedMap(
-            rnn=theta.cell, packed_src=packed_src, atten=theta.atten),
+            rnn=theta.cell,
+            packed_src=packed_src,
+            atten=theta.atten,
+            global_step=theta.global_step),
         state0=state0,
         inputs=py_utils.NestedMap(
             act=inputs,
@@ -1191,7 +1208,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
     Returns:
       A tuple (atten_context, rnn_output, atten_probs).
 
-      - atten_context: a tensor of [time, batch, attention.hidden_dim].
+      - atten_context: a tensor of [time, batch, attention.context_dim].
       - rnn_output: a tensor of [time, batch, rcell.num_output_nodes].
       - atten_probs: a tensor of [time, batch, source_seq_length].
     """
@@ -1254,7 +1271,7 @@ class FRNNWithAttention(base_layer.BaseLayer):
     Returns:
       A tuple (atten_context, rnn_output, atten_probs, final_state).
 
-      - atten_context: a tensor of [time, batch, attention.hidden_dim].
+      - atten_context: a tensor of [time, batch, attention.context_dim].
       - rnn_output: a tensor of [time, batch, rcell.num_output_nodes].
       - atten_probs: a tensor of [time, batch, source_seq_length].
       - final_state: The final recurrent state.
@@ -1317,8 +1334,8 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
     """Constructs a MultiSourceFRNNWithAttention layer with params."""
     super(MultiSourceFRNNWithAttention, self).__init__(params)
     p = self.params
-    assert p.packed_input is False, ('packed input is not supported for '
-                                     'MultiSourceFRNNWithAttention')
+    assert not p.packed_input, ('packed input is not supported for '
+                                'MultiSourceFRNNWithAttention')
     if p.atten_merger is None:
       raise ValueError('Merger layer cannot be none!')
     if not isinstance(p.source_names, list) or not p.source_names:
@@ -1338,11 +1355,15 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
         att_params.name = 'atten_%s' % src_name
       else:
         att_params = p.attention_tpl.Copy()
-        att_params.name = ('atten_shared'
-                           if p.share_attention else 'atten_%s' % (src_name))
+        if p.share_attention:
+          att_params.name = 'atten_shared'
+        else:
+          att_params.name = 'atten_%s' % (src_name)
       if att_params.params_init is None:
         att_params.params_init = py_utils.WeightInit.Gaussian(
-            1. / math.sqrt(att_params.source_dim + att_params.query_dim))
+            1. / math.sqrt(att_params.source_dim + att_params.query_dim),
+            seed=p.random_seed)
+      att_params.atten_dropout_deterministic = True
       params_atten.append(att_params)
       self._source_dims.append(att_params.source_dim)
       if p.share_attention:
@@ -1478,8 +1499,11 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
       for i, src_name in enumerate(p.source_names):
         att_idx = (0 if p.share_attention else i)
         local_ctxs.append(attentions[att_idx].ComputeContextVectorWithSource(
-            theta.attens[src_name], theta.packed_src[src_name], query_vec,
-            state0.atten)[0])
+            theta.attens[src_name],
+            theta.packed_src[src_name],
+            query_vec,
+            state0.atten,
+        )[0])
       state1.atten = self.atten_merger.FProp(theta.atten_merger, local_ctxs,
                                              query_vec)
       return state1, py_utils.NestedMap()
@@ -1523,8 +1547,8 @@ class BidirectionalFRNNQuasi(base_layer.BaseLayer):
   def __init__(self, params):
     super(BidirectionalFRNNQuasi, self).__init__(params)
     p = params
-    assert p.packed_input is False, ('packed input is not supported for '
-                                     'BidirectionalFRNNQuasi')
+    assert not p.packed_input, ('packed input is not supported for '
+                                'BidirectionalFRNNQuasi')
     params_forward = FRNN.Params()
     params_forward.name = 'fwd'
     params_forward.dtype = p.dtype

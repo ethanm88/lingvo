@@ -21,11 +21,11 @@ from __future__ import print_function
 
 import numpy as np
 import tensorflow as tf
-
 from lingvo.core import plot
+from lingvo.core import test_utils
 
 
-class PlotTest(tf.test.TestCase):
+class PlotTest(test_utils.TestCase):
 
   def testToUnicode(self):
     str_str = 'pójdź kińże tę chmurność w głąb flaszy'
@@ -35,7 +35,7 @@ class PlotTest(tf.test.TestCase):
     self.assertEqual(plot.ToUnicode(str_str), plot.ToUnicode(uni_str))
 
 
-class MatplotlibFigureSummaryTest(tf.test.TestCase):
+class MatplotlibFigureSummaryTest(test_utils.TestCase):
 
   FIGSIZE = (8, 4)
   EXPECTED_DPI = 100
@@ -225,6 +225,24 @@ class MatplotlibFigureSummaryTest(tf.test.TestCase):
     value = summary.value[0]
     self.assertGreater(value.image.width, 0)
     self.assertGreater(value.image.height, 0)
+
+  def testScatter(self):
+    summary = plot.Scatter(
+        'summary', (4, 4), xs=np.random.rand(10), ys=np.random.rand(10))
+    self.assertEqual(len(summary.value), 1)
+    value = summary.value[0]
+    self.assertGreater(value.image.width, 0)
+    self.assertGreater(value.image.height, 0)
+
+  def testScatter3D(self):
+    # Passing `zs` means the plot tries to use '3d' projection, which is not
+    # installed by default, so raises a ValueError.
+    with self.assertRaisesRegexp(ValueError, 'Unknown projection'):
+      _ = plot.Scatter(
+          'summary', (4, 4),
+          xs=np.random.rand(10),
+          ys=np.random.rand(10),
+          zs=np.random.rand(10))
 
 
 if __name__ == '__main__':

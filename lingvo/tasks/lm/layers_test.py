@@ -29,11 +29,9 @@ from lingvo.tasks.lm import layers as lm_layers
 FLAGS = tf.flags.FLAGS
 
 
-class RnnLmNoEmbeddingTest(tf.test.TestCase):
+class RnnLmNoEmbeddingTest(test_utils.TestCase):
 
-  def testBasic(self):
-    time, batch, dims, vocab = 5, 3, 6, 8
-
+  def _testParams(self, dims, vocab):
     p = lm_layers.RnnLmNoEmbedding.Params()
     p.name = 'rnnlm'
     p.vocab_size = vocab
@@ -41,9 +39,14 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
     p.rnns.cell_tpl.num_input_nodes = dims
     p.softmax.input_dim = dims
     p.softmax.num_classes = vocab
+    return p
+
+  def testBasic(self):
+    time, batch, dims, vocab = 5, 3, 6, 8
+    p = self._testParams(dims, vocab)
 
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.normal(size=[time, batch, dims])
       inputs = tf.constant(inputs, tf.float32)
@@ -70,18 +73,13 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
 
   def testProjection(self):
     time, batch, dims, proj, vocab = 5, 3, 6, 4, 8
-
-    p = lm_layers.RnnLmNoEmbedding.Params()
-    p.name = 'rnnlm'
-    p.vocab_size = vocab
+    p = self._testParams(dims, vocab)
     p.rnns.cell_tpl.num_output_nodes = proj
     p.rnns.cell_tpl.num_hidden_nodes = dims
-    p.rnns.cell_tpl.num_input_nodes = dims
     p.softmax.input_dim = proj
-    p.softmax.num_classes = vocab
 
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.normal(size=[time, batch, dims])
       inputs = tf.constant(inputs, tf.float32)
@@ -108,18 +106,11 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
 
   def testBasicGrad(self):
     time, batch, dims, vocab = 5, 3, 6, 8
-
-    p = lm_layers.RnnLmNoEmbedding.Params()
+    p = self._testParams(dims, vocab)
     p.dtype = tf.float64
-    p.name = 'rnnlm'
-    p.vocab_size = vocab
-    p.rnns.cell_tpl.num_output_nodes = dims
-    p.rnns.cell_tpl.num_input_nodes = dims
-    p.softmax.input_dim = dims
-    p.softmax.num_classes = vocab
 
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.normal(size=[time, batch, dims])
       inputs = tf.constant(inputs, tf.float64)
@@ -150,20 +141,13 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
 
   def testDirectFeatures(self,):
     time, batch, dims, vocab = 5, 3, 6, 8
+    p = self._testParams(dims, vocab)
     direct_features_dim = 4
-
-    p = lm_layers.RnnLmNoEmbedding.Params()
-    p.name = 'rnnlm'
-    p.vocab_size = vocab
-    p.rnns.cell_tpl.num_output_nodes = dims
-    p.rnns.cell_tpl.num_input_nodes = dims
-    p.softmax.num_classes = vocab
-
     p.direct_features_dim = direct_features_dim
     p.softmax.input_dim = dims + direct_features_dim
 
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.normal(size=[time, batch, dims])
       inputs = tf.constant(inputs, tf.float32)
@@ -194,8 +178,47 @@ class RnnLmNoEmbeddingTest(tf.test.TestCase):
       self.assertAllEqual(xent_output_val.per_example_argmax,
                           np.argmax(xent_output_val.logits, axis=-1))
 
+  def testCombineStates(self):
+    time, batch, dims, vocab = 5, 3, 6, 8
+    p = self._testParams(dims, vocab)
 
-class RnnLmTest(tf.test.TestCase):
+    with self.session(use_gpu=True) as sess:
+      lm = p.Instantiate()
+      np.random.seed(12345)
+      inputs = np.random.normal(size=[time, batch, dims])
+      inputs = tf.constant(inputs, tf.float32)
+      paddings = np.zeros([time, batch])
+      paddings[-1] = 1.0
+      paddings = tf.constant(paddings, tf.float32)
+      targets = tf.constant(
+          np.random.randint(vocab, size=(time, batch)), tf.int32)
+      sess.run(tf.global_variables_initializer())
+
+      state0 = lm.zero_state(batch)
+      _, state1 = lm.FPropDefaultTheta(
+          inputs=inputs,
+          paddings=paddings,
+          state0=state0,
+          labels=py_utils.NestedMap(
+              class_weights=1 - paddings, class_ids=targets))
+      switch = tf.constant([True, True, False], dtype=tf.bool)
+      combined_state = lm.CombineStates(state0, state1, switch)
+      state0_val, state1_val, combined_state_val = sess.run(
+          [state0, state1, combined_state])
+
+      print('state1_val', state1_val)
+      print('combined_state_val', combined_state_val)
+      combined_m_state = combined_state_val.rnn[0].m
+      combined_c_state = combined_state_val.rnn[0].c
+      self.assertAllEqual(combined_m_state[0], state0_val.rnn[0].m[0])
+      self.assertAllEqual(combined_c_state[0], state0_val.rnn[0].c[0])
+      self.assertAllEqual(combined_m_state[1], state0_val.rnn[0].m[1])
+      self.assertAllEqual(combined_c_state[1], state0_val.rnn[0].c[1])
+      self.assertAllEqual(combined_m_state[2], state1_val.rnn[0].m[2])
+      self.assertAllEqual(combined_c_state[2], state1_val.rnn[0].c[2])
+
+
+class RnnLmTest(test_utils.TestCase):
 
   def testBasic(self):
     time, batch, dims, vocab = 5, 3, 6, 8
@@ -211,7 +234,7 @@ class RnnLmTest(tf.test.TestCase):
     p.softmax.num_classes = vocab
 
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.randint(vocab, size=[time, batch])
       targets = np.zeros([time, batch])
@@ -257,7 +280,7 @@ class RnnLmTest(tf.test.TestCase):
     p.softmax.num_classes = vocab
 
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs = np.random.randint(vocab, size=[time, batch])
       targets = np.zeros([time, batch])
       targets[:-1] = inputs[1:]
@@ -297,7 +320,7 @@ class RnnLmTest(tf.test.TestCase):
     p.softmax.num_classes = vocab
 
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.randint(vocab, size=[time, batch])
       targets = np.zeros([time, batch])
@@ -333,7 +356,157 @@ class RnnLmTest(tf.test.TestCase):
         self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
 
 
-class MoeLmTest(tf.test.TestCase):
+class ConditionalRnnLmTest(test_utils.TestCase):
+
+  def testBasic(self):
+    time, batch, dims, vocab, condition_dim = 5, 3, 6, 8, 7
+
+    p = lm_layers.ConditionalRnnLm.Params()
+    p.name = 'conditionalrnnlm'
+    p.vocab_size = vocab
+    p.emb.vocab_size = vocab
+    p.emb.embedding_dim = dims
+    model_dim = dims + condition_dim
+    p.rnns.cell_tpl.num_output_nodes = model_dim
+    p.rnns.cell_tpl.num_input_nodes = model_dim
+    p.softmax.input_dim = model_dim
+    p.softmax.num_classes = vocab
+    p.condition_dim = condition_dim
+
+    with self.session(use_gpu=True) as sess:
+      lm = p.Instantiate()
+      np.random.seed(12345)
+      inputs = np.random.randint(vocab, size=[time, batch])
+      targets = np.zeros([time, batch])
+      targets[:-1] = inputs[1:]
+      inputs = tf.constant(inputs, tf.int32)
+      paddings = np.zeros([time, batch])
+      paddings[-1] = 1.0
+      paddings = tf.constant(paddings, tf.float32)
+      targets = tf.constant(targets, tf.int32)
+      condition = tf.constant(np.ones([batch, condition_dim]), tf.float64)
+      sess.run(tf.global_variables_initializer())
+      xent_output, state1 = lm.FPropDefaultTheta(
+          inputs=inputs,
+          paddings=paddings,
+          state0=lm.zero_state(batch),
+          condition=condition,
+          labels=py_utils.NestedMap(
+              class_weights=1 - paddings, class_ids=targets))
+
+      xent_output_val, state1_val = sess.run([xent_output, state1])
+
+      print('xent_output_val', xent_output_val)
+      print('state1', state1_val)
+      test_utils.CompareToGoldenSingleFloat(self, 2.10713076, xent_output_val.avg_xent)  # pyformat: disable pylint: disable=line-too-long
+      self.assertAllEqual(xent_output_val.per_example_argmax,
+                          np.argmax(xent_output_val.logits, axis=-1))
+
+  def testDropout(self):
+    seed = 12345
+    tf.set_random_seed(seed)
+    np.random.seed(seed)
+
+    time, batch, dims, vocab, condition_dim = 5, 3, 6, 8, 7
+
+    p = lm_layers.ConditionalRnnLm.Params()
+    p.name = 'conditionalrnnlm'
+    p.vocab_size = vocab
+    p.emb.vocab_size = vocab
+    p.emb.embedding_dim = dims
+    p.embedding_dropout_keep_prob = 0.8
+    p.embedding_dropout_seed = seed
+    model_dim = dims + condition_dim
+    p.rnns.cell_tpl.num_output_nodes = model_dim
+    p.rnns.cell_tpl.num_input_nodes = model_dim
+    p.softmax.input_dim = model_dim
+    p.softmax.num_classes = vocab
+    p.condition_dim = condition_dim
+
+    with self.session(use_gpu=True) as sess:
+      lm = p.Instantiate()
+      inputs = np.random.randint(vocab, size=[time, batch])
+      targets = np.zeros([time, batch])
+      targets[:-1] = inputs[1:]
+      inputs = tf.constant(inputs, tf.int32)
+      paddings = np.zeros([time, batch])
+      paddings[-1] = 1.0
+      paddings = tf.constant(paddings, tf.float32)
+      targets = tf.constant(targets, tf.int32)
+      condition = tf.constant(np.ones([batch, condition_dim]), tf.float64)
+      sess.run(tf.global_variables_initializer())
+      xent_output, state1 = lm.FPropDefaultTheta(
+          inputs=inputs,
+          paddings=paddings,
+          state0=lm.zero_state(batch),
+          condition=condition,
+          labels=py_utils.NestedMap(
+              class_weights=1 - paddings, class_ids=targets))
+
+      xent_output_val, state1_val = sess.run([xent_output, state1])
+
+      print('xent_output_val', xent_output_val)
+      print('state1', state1_val)
+      test_utils.CompareToGoldenSingleFloat(self, 2.17278885, xent_output_val.avg_xent)  # pyformat: disable pylint: disable=line-too-long
+      self.assertAllEqual(xent_output_val.per_example_argmax,
+                          np.argmax(xent_output_val.logits, axis=-1))
+
+  def testBasicGrad(self):
+    time, batch, dims, vocab, condition_dim = 5, 3, 6, 8, 7
+
+    p = lm_layers.ConditionalRnnLm.Params()
+    p.name = 'conditionalrnnlm'
+    p.dtype = tf.float64
+    p.vocab_size = vocab
+    p.emb.vocab_size = vocab
+    p.emb.embedding_dim = dims
+    model_dim = dims + condition_dim
+    p.rnns.cell_tpl.num_output_nodes = model_dim
+    p.rnns.cell_tpl.num_input_nodes = model_dim
+    p.softmax.input_dim = model_dim
+    p.softmax.num_classes = vocab
+    p.condition_dim = condition_dim
+
+    with self.session(use_gpu=False, graph=tf.Graph()) as sess:
+      lm = p.Instantiate()
+      np.random.seed(12345)
+      inputs = np.random.randint(vocab, size=[time, batch])
+      targets = np.zeros([time, batch])
+      targets[:-1] = inputs[1:]
+      inputs = tf.constant(inputs, tf.int32)
+      paddings = np.zeros([time, batch])
+      paddings[-1] = 1.0
+      paddings = tf.constant(paddings, tf.float64)
+      targets = tf.constant(targets, tf.int32)
+      condition = tf.constant(np.ones([batch, condition_dim]), tf.float64)
+      sess.run(tf.global_variables_initializer())
+      xent_output, _ = lm.FPropDefaultTheta(
+          inputs=inputs,
+          paddings=paddings,
+          state0=lm.zero_state(batch),
+          condition=condition,
+          labels=py_utils.NestedMap(
+              class_weights=1 - paddings, class_ids=targets))
+
+      lm_vars = lm.vars.Flatten()
+      # Now add the backward graph.
+      grads = tf.gradients(xent_output.avg_xent, lm_vars)
+
+      for i, x in enumerate(grads):
+        if isinstance(x, tf.IndexedSlices):
+          grads[i] = tf.unsorted_segment_sum(x.values, x.indices,
+                                             x.dense_shape[0])
+
+      tf.global_variables_initializer().run()
+      self.assertEqual(len(lm_vars), len(grads))
+      for x, grad_x in zip(lm_vars, grads):
+        grad_symbolic = sess.run(grad_x)
+        grad_numeric = test_utils.ComputeNumericGradient(
+            sess, xent_output.avg_xent, x, delta=1e-6)
+        self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
+
+
+class MoeLmTest(test_utils.TestCase):
 
   def _MoeLmParams(self, vocab, shared_emb, add_postgating_rnn=True):
     p = lm_layers.MoeLm.Params()
@@ -372,7 +545,7 @@ class MoeLmTest(tf.test.TestCase):
     with self.session(graph=tf.Graph()) as sess:
       np.random.seed(54321)
       tf.set_random_seed(123456)
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs, paddings, labels = self._GetData(vocab, time, batch)
       sess.run(tf.global_variables_initializer())
       xent_output, state1 = lm.FPropDefaultTheta(
@@ -396,7 +569,7 @@ class MoeLmTest(tf.test.TestCase):
     with self.session(graph=tf.Graph()) as sess:
       np.random.seed(54321)
       tf.set_random_seed(123456)
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs, paddings, labels = self._GetData(vocab, time, batch)
       sess.run(tf.global_variables_initializer())
       xent_output, state1 = lm.FPropDefaultTheta(
@@ -420,7 +593,7 @@ class MoeLmTest(tf.test.TestCase):
     with self.session(graph=tf.Graph()) as sess:
       np.random.seed(54321)
       tf.set_random_seed(123456)
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs, paddings, labels = self._GetData(vocab, time, batch)
       sess.run(tf.global_variables_initializer())
       xent_output, state1 = lm.FPropDefaultTheta(
@@ -445,7 +618,7 @@ class MoeLmTest(tf.test.TestCase):
     with self.session(graph=tf.Graph()) as sess:
       np.random.seed(54321)
       tf.set_random_seed(123456)
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs, paddings, labels = self._GetData(vocab, time, batch)
       sess.run(tf.global_variables_initializer())
       xent_output, _ = lm.FPropDefaultTheta(
@@ -475,7 +648,7 @@ class MoeLmTest(tf.test.TestCase):
             grad_numeric.reshape([-1])[::step])
 
 
-class TransformerLmNoEmbeddingTest(tf.test.TestCase):
+class TransformerLmNoEmbeddingTest(test_utils.TestCase):
 
   def _testParams(self, dtype=tf.float32):
     model_dim, hidden_dim, vocab_size = 4, 6, 8
@@ -509,7 +682,7 @@ class TransformerLmNoEmbeddingTest(tf.test.TestCase):
   def testBasic(self):
     p = self._testParams(dtype=tf.float32)
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs, paddings, targets = self._testInputs(dtype=tf.float32)
       sess.run(tf.global_variables_initializer())
       xent_output, _ = lm.FPropDefaultTheta(
@@ -526,7 +699,7 @@ class TransformerLmNoEmbeddingTest(tf.test.TestCase):
   def testBasicGrad(self):
     p = self._testParams(dtype=tf.float64)
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs, paddings, targets = self._testInputs(dtype=tf.float64)
       xent_output, _ = lm.FPropDefaultTheta(
           inputs=inputs,
@@ -549,7 +722,7 @@ class TransformerLmNoEmbeddingTest(tf.test.TestCase):
   def testStep(self):
     p = self._testParams(dtype=tf.float32)
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs, paddings, _ = self._testInputs(dtype=tf.float32, last_padding=0.0)
 
       sess.run(tf.global_variables_initializer())
@@ -572,7 +745,7 @@ class TransformerLmNoEmbeddingTest(tf.test.TestCase):
       self.assertAllClose(logits1_v, logits2_v)
 
 
-class TransformerLmTest(tf.test.TestCase):
+class TransformerLmTest(test_utils.TestCase):
 
   def testBasic(self):
     time, batch, dims, hidden_dim, vocab = 5, 3, 6, 4, 8
@@ -592,7 +765,7 @@ class TransformerLmTest(tf.test.TestCase):
     p.softmax.num_classes = vocab
 
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.randint(vocab, size=[time, batch])
       targets = np.zeros([time, batch])
@@ -637,7 +810,7 @@ class TransformerLmTest(tf.test.TestCase):
     p.softmax.num_classes = vocab
 
     with self.session(use_gpu=True) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       inputs = np.random.randint(vocab, size=[time, batch])
       targets = np.zeros([time, batch])
       targets[:-1] = inputs[1:]
@@ -678,7 +851,7 @@ class TransformerLmTest(tf.test.TestCase):
     p.softmax.num_classes = vocab
 
     with self.session(use_gpu=False, graph=tf.Graph()) as sess:
-      lm = p.cls(p)
+      lm = p.Instantiate()
       np.random.seed(12345)
       inputs = np.random.randint(vocab, size=[time, batch])
       targets = np.zeros([time, batch])
@@ -704,6 +877,152 @@ class TransformerLmTest(tf.test.TestCase):
 
       tf.global_variables_initializer().run()
       self.assertEqual(len(lm_vars), len(grads))
+      for x, grad_x in zip(lm_vars, grads):
+        grad_symbolic = sess.run(grad_x)
+        grad_numeric = test_utils.ComputeNumericGradient(
+            sess, xent_output.avg_xent, x, delta=1e-6)
+        self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
+
+
+class GPipeTransformerLmNoEmbeddingTest(test_utils.TestCase):
+
+  def _testParams(self, dtype=tf.float32):
+    model_dim, hidden_dim, vocab_size = 4, 6, 8
+    p = lm_layers.GPipeTransformerLmNoEmbedding.Params()
+    p.name = 'xformerlm'
+    p.random_seed = 93820986
+    p.dtype = dtype
+    p.vocab_size = vocab_size
+    p.model_dim = model_dim
+    p.stack.num_encoder_layers = 4
+    trans_tpl = p.stack.encoder_tpl
+    trans_tpl.tr_atten_tpl.num_attention_heads = 2
+    trans_tpl.tr_fflayer_tpl.hidden_dim = hidden_dim
+    p.softmax.num_classes = vocab_size
+    return p
+
+  def _testInputs(self, dtype=tf.float32, last_padding=1.0):
+    time, batch, model_dim, vocab_size = 5, 3, 4, 8
+    np.random.seed(12345)
+    inputs = np.random.normal(size=[time, batch, model_dim])
+    inputs = tf.constant(inputs, dtype)
+    paddings = np.zeros([time, batch])
+    paddings[-1] = last_padding
+    paddings = tf.constant(paddings, dtype)
+    targets = tf.constant(
+        np.random.randint(vocab_size, size=(time, batch)), tf.int32)
+    return inputs, paddings, targets
+
+  def testBasic(self):
+    p = self._testParams(dtype=tf.float32)
+    with self.session(use_gpu=True) as sess:
+      lm = p.Instantiate()
+      assert p.stack.encoder_tpl.tr_atten_tpl.is_masked
+      inputs, paddings, targets = self._testInputs(dtype=tf.float32)
+      sess.run(tf.global_variables_initializer())
+      xent_output, _ = lm.FPropDefaultTheta(
+          inputs=inputs,
+          paddings=paddings,
+          labels=py_utils.NestedMap(
+              class_weights=1 - paddings, class_ids=targets))
+      xent_output_val = sess.run(xent_output)
+      print('xformer xent_output_val.avg_xent', xent_output_val.avg_xent)
+      test_utils.CompareToGoldenSingleFloat(self, 1.9776554,
+                                            xent_output_val.avg_xent)
+      self.assertAllEqual(xent_output_val.per_example_argmax,
+                          np.argmax(xent_output_val.logits, axis=-1))
+
+  def testBasicGrad(self):
+    p = self._testParams(dtype=tf.float64)
+    with self.session(use_gpu=False, graph=tf.Graph()) as sess:
+      lm = p.Instantiate()
+      inputs, paddings, targets = self._testInputs(dtype=tf.float64)
+      xent_output, _ = lm.FPropDefaultTheta(
+          inputs=inputs,
+          paddings=paddings,
+          labels=py_utils.NestedMap(
+              class_weights=1 - paddings, class_ids=targets))
+
+      lm_vars = lm.vars.Flatten()
+      # Now add the backward graph.
+      grads = tf.gradients(xent_output.avg_xent, lm_vars)
+
+      sess.run(tf.global_variables_initializer())
+      self.assertEqual(len(lm_vars), len(grads))
+      for x, grad_x in zip(lm_vars, grads):
+        grad_symbolic = sess.run(grad_x)
+        grad_numeric = test_utils.ComputeNumericGradient(
+            sess, xent_output.avg_xent, x, delta=1e-6)
+        self.assertAllClose(grad_symbolic, grad_numeric, atol=0.005)
+
+
+class GPipeTransformerLmTest(test_utils.TestCase):
+
+  def _testParams(self, batch, dims, hidden_dim, vocab):
+    p = lm_layers.GPipeTransformerLm.Params()
+    p.name = 'transformerlm'
+    p.vocab_size = vocab
+    p.emb.vocab_size = vocab
+    p.emb.embedding_dim = dims
+    p.model_dim = dims
+    p.stack.num_encoder_layers = 4
+    trans_tpl = p.stack.encoder_tpl
+    trans_tpl.tr_atten_tpl.num_attention_heads = 2
+    trans_tpl.tr_fflayer_tpl.hidden_dim = hidden_dim
+    p.softmax.num_classes = vocab
+    return p
+
+  def _SetupGraph(self, p, time, batch, vocab, return_grad=False):
+    lm = p.Instantiate()
+    np.random.seed(12345)
+    inputs = np.random.randint(vocab, size=[time, batch])
+    targets = np.zeros([time, batch])
+    targets[:-1] = inputs[1:]
+    inputs = tf.constant(inputs, tf.int32)
+    paddings = np.zeros([time, batch])
+    paddings[-1] = 1.0
+    paddings = tf.constant(paddings, tf.float64 if return_grad else tf.float32)
+    targets = tf.constant(targets, tf.int32)
+    xent_output, _ = lm.FPropDefaultTheta(
+        inputs=inputs,
+        paddings=paddings,
+        labels=py_utils.NestedMap(
+            class_weights=1 - paddings, class_ids=targets))
+    if not return_grad:
+      return xent_output
+
+    lm_vars = lm.vars.Flatten()
+    grads = tf.gradients(xent_output.avg_xent, lm_vars)
+    for i, x in enumerate(grads):
+      if isinstance(x, tf.IndexedSlices):
+        grads[i] = tf.unsorted_segment_sum(x.values, x.indices,
+                                           x.dense_shape[0])
+    self.assertEqual(len(lm_vars), len(grads))
+    return xent_output, lm_vars, grads
+
+  def testBasic(self):
+    time, batch, dims, hidden_dim, vocab = 5, 3, 6, 4, 8
+    p = self._testParams(batch, dims, hidden_dim, vocab)
+    xent_output = self._SetupGraph(p, time, batch, vocab)
+    assert p.stack.encoder_tpl.tr_atten_tpl.is_masked
+    with self.session() as sess:
+      sess.run(tf.global_variables_initializer())
+      xent_output_val = sess.run(xent_output)
+
+      print('xent_output_val', xent_output_val)
+      test_utils.CompareToGoldenSingleFloat(self, 3.06884766,
+                                            xent_output_val.avg_xent)
+      self.assertAllEqual(xent_output_val.per_example_argmax,
+                          np.argmax(xent_output_val.logits, axis=-1))
+
+  def testBasicGrad(self):
+    time, batch, dims, hidden_dim, vocab = 5, 3, 6, 4, 8
+    p = self._testParams(batch, dims, hidden_dim, vocab)
+    p.dtype = tf.float64
+    xent_output, lm_vars, grads = self._SetupGraph(
+        p, time, batch, vocab, return_grad=True)
+    with self.session() as sess:
+      sess.run(tf.global_variables_initializer())
       for x, grad_x in zip(lm_vars, grads):
         grad_symbolic = sess.run(grad_x)
         grad_numeric = test_utils.ComputeNumericGradient(

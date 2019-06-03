@@ -19,14 +19,15 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
 from lingvo import model_registry
 from lingvo.core import base_input_generator
 from lingvo.core import base_model
 from lingvo.core import base_model_params
 from lingvo.core import inference_graph_exporter
 from lingvo.core import inference_graph_pb2
+from lingvo.core import predictor
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 
 
 class DummyLegacyModel(base_model.BaseTask):
@@ -37,6 +38,8 @@ class DummyLegacyModel(base_model.BaseTask):
     return p
 
   def Inference(self):
+    if py_utils.use_tpu():
+      raise NotImplementedError('TPU is not supported.')
     with tf.name_scope('inference'):
       feed1 = tf.placeholder(name='feed1_node', dtype=tf.float32, shape=[1])
       fetch1 = tf.identity(feed1, name='fetch1_node')
@@ -105,7 +108,7 @@ class DummyModelParams(base_model_params.SingleTaskModelParams):
     return p
 
 
-class InferenceGraphExporterTest(tf.test.TestCase):
+class InferenceGraphExporterTest(test_utils.TestCase):
 
   def testExportModelParamsWithSubgraphDict(self):
     params = model_registry.GetParams('test.DummyLegacyModelParams', 'Test')
@@ -138,8 +141,23 @@ class InferenceGraphExporterTest(tf.test.TestCase):
     self.assertEqual(subgraph.fetches['fetch1'], 'inference/fetch1_node:0')
     self.assertEqual(subgraph.fetches['fetch_op'], 'inference/fetch1_node')
 
+  def testExportModelDoesNotAffectFlagsOnException(self):
+    initial_flags = {k: tf.flags.FLAGS[k].value for k in tf.flags.FLAGS}
+    params = model_registry.GetParams('test.DummyLegacyModelParams', 'Test')
+    with self.assertRaises(NotImplementedError):
+      inference_graph_exporter.InferenceGraphExporter.Export(
+          params,
+          device_options=inference_graph_exporter.InferenceDeviceOptions(
+              device='tpu',
+              retain_device_placement=False,
+              var_options=None,
+              gen_init_op=True,
+              dtype_override=None))
+    self.assertDictEqual(initial_flags,
+                         {k: tf.flags.FLAGS[k].value for k in tf.flags.FLAGS})
 
-class NoConstGuaranteeScopeTest(tf.test.TestCase):
+
+class NoConstGuaranteeScopeTest(test_utils.TestCase):
 
   def testNoConsting(self):
     with inference_graph_exporter.ConstGuaranteeScope():
@@ -183,7 +201,10 @@ class LinearModel(base_model.BaseTask):
     """Computes y = w^T x + b. Returns y and x, as outputs and inputs."""
     with tf.variable_scope('inference'):
       x = tf.placeholder(dtype=tf.float32, name='input')
-      y = tf.reduce_sum(self._w * x) + self._b
+      r = tf.random.stateless_uniform([3],
+                                      seed=py_utils.GenerateStepSeedPair(
+                                          self.params, self.theta.global_step))
+      y = tf.reduce_sum((self._w + r) * x) + self._b
       return {'default': ({'output': y}, {'input': x})}
 
 
@@ -234,7 +255,24 @@ class LinearModelTpuParams(base_model_params.SingleTaskModelParams):
     return p
 
 
-class InferenceGraphExporterLinearModelTest(tf.test.TestCase):
+@model_registry.RegisterSingleTaskModel
+class LinearModelTpuParamsWithEma(base_model_params.SingleTaskModelParams):
+
+  @classmethod
+  def Test(cls):
+    p = base_input_generator.BaseSequenceInputGenerator.Params()
+    p.name = 'input'
+    return p
+
+  @classmethod
+  def Task(cls):
+    p = LinearModelTpu.Params()
+    p.name = 'testing'
+    p.train.ema_decay = 0.99
+    return p
+
+
+class InferenceGraphExporterLinearModelTest(test_utils.TestCase):
 
   def testExport(self):
     """Test basic export."""
@@ -242,6 +280,16 @@ class InferenceGraphExporterLinearModelTest(tf.test.TestCase):
     inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
         params, subgraph_filter=['default'])
     self.assertIn('default', inference_graph.subgraphs)
+
+  def testExportFreezeDefault(self):
+    """Test exporting frozen graph."""
+    params = model_registry.GetParams('test.LinearModelParams', 'Test')
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params, freeze_defaults=True, subgraph_filter=['default'])
+    self.assertIn('default', inference_graph.subgraphs)
+    # Test graphs are well-formed and importable.
+    with tf.Graph().as_default():
+      tf.import_graph_def(inference_graph.graph_def)
 
   def testTpuBfloat16OverrideExport(self):
     """Test that we can export with tf.bfloat16 dtype."""
@@ -256,6 +304,53 @@ class InferenceGraphExporterLinearModelTest(tf.test.TestCase):
             gen_init_op=True,
             dtype_override=tf.bfloat16))
     self.assertIn('tpu', inference_graph.subgraphs)
+
+  def testTpuBfloat16OverrideExportWithEma(self):
+    """Test that we can export with tf.bfloat16 dtype."""
+    params = model_registry.GetParams('test.LinearModelTpuParamsWithEma',
+                                      'Test')
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params,
+        subgraph_filter=['tpu'],
+        device_options=inference_graph_exporter.InferenceDeviceOptions(
+            device='tpu',
+            retain_device_placement=True,
+            var_options='ON_DEVICE',
+            gen_init_op=True,
+            dtype_override=tf.bfloat16))
+    self.assertIn('tpu', inference_graph.subgraphs)
+
+  def testExportWithRandomSeeds(self):
+    """Test the effect of setting random seeds on export."""
+    params = model_registry.GetParams('test.LinearModelParams', 'Test')
+    # Default -- use random_seed = None.
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params, subgraph_filter=['default'])
+    pred = predictor.Predictor(inference_graph)
+    [no_op_seed_1] = pred.Run(['output'], input=3)
+    [no_op_seed_2] = pred.Run(['output'], input=3)
+    self.assertNotEqual(no_op_seed_1, no_op_seed_2)
+    pred = predictor.Predictor(inference_graph)
+    [no_op_seed_3] = pred.Run(['output'], input=3)
+    self.assertNotEqual(no_op_seed_1, no_op_seed_3)
+
+    # Use a fixed random_seed.
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params, subgraph_filter=['default'], random_seed=1234)
+    pred = predictor.Predictor(inference_graph)
+    [fixed_op_seed_1] = pred.Run(['output'], input=3)
+    [fixed_op_seed_2] = pred.Run(['output'], input=3)
+    self.assertEqual(fixed_op_seed_1, fixed_op_seed_2)
+    pred = predictor.Predictor(inference_graph)
+    [fixed_op_seed_3] = pred.Run(['output'], input=3)
+    self.assertEqual(fixed_op_seed_1, fixed_op_seed_3)
+
+    # A different seed gives different results.
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params, subgraph_filter=['default'], random_seed=1235)
+    pred = predictor.Predictor(inference_graph)
+    [fixed_op_seed_4] = pred.Run(['output'], input=3)
+    self.assertNotEqual(fixed_op_seed_1, fixed_op_seed_4)
 
 
 if __name__ == '__main__':

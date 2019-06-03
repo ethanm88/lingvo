@@ -21,16 +21,16 @@ import numpy as np
 from six.moves import range
 from six.moves import zip
 import tensorflow as tf
-
 from lingvo.core import layers_with_attention
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 from lingvo.tasks.mt import layers as mt_layers
 
 
 NUMPY_RANDOM_SEED = 505837249
 
 
-class LayersTest(tf.test.TestCase):
+class LayersTest(test_utils.TestCase):
 
   def _TransformerParams(self, is_eval=False, layer=mt_layers.TransformerStack):
     model_dim = 2
@@ -43,6 +43,13 @@ class LayersTest(tf.test.TestCase):
     params.transformer_tpl.tr_fflayer_tpl.hidden_dim = model_dim
     params.random_seed = 0
     params.is_eval = is_eval
+    return params
+
+  def _ContextualTransformerParams(self,
+                                   is_eval=False,
+                                   layer=mt_layers.TransformerStack):
+    params = self._TransformerParams(is_eval, layer)
+    params.has_aux_attention = True
     return params
 
   def _TransformerStackFProp(self, dtype, fprop_dtype, layer):
@@ -254,6 +261,52 @@ class LayersTest(tf.test.TestCase):
       tf.logging.info(np.array_repr(actual_probs_ref))
       self.assertAllClose(expected_ctx, actual_ctx_ref)
       self.assertAllClose(expected_probs, actual_probs_ref)
+
+  def testContextualTransformerStackFProp(self):
+    # time = 2,
+    batch = 3
+    dtype = tf.float32
+    fprop_dtype = tf.float32
+    layer = mt_layers.TransformerStack
+    tf.flags.FLAGS.tpu_compatible = True
+    with self.session(use_gpu=False) as sess:
+      params = self._ContextualTransformerParams(layer=layer)
+      params.dtype = dtype
+      params.fprop_dtype = fprop_dtype
+      xformer = layer(params)
+
+      input_arr = np.array([
+          [[0, 1]] * batch,
+          [[1, -1]] * batch,
+      ], dtype=int)
+
+      context_arr = np.array([
+          [[0, 1]] * batch,
+          [[1, -1]] * batch,
+          [[-1, 1]] * batch,
+      ],
+                             dtype=int)
+      paddings_arr = np.array([[0] * batch, [0] * batch], dtype=int)
+      context_paddings_arr = np.array([[0] * batch, [0] * batch, [0] * batch],
+                                      dtype=int)
+      inputs = tf.constant(input_arr.tolist(), dtype=fprop_dtype)
+      paddings = tf.constant(paddings_arr.tolist(), dtype=fprop_dtype)
+      context = tf.constant(context_arr.tolist(), dtype=fprop_dtype)
+      context_paddings = tf.constant(
+          context_paddings_arr.tolist(), dtype=fprop_dtype)
+
+      output, _, _ = xformer.FProp(
+          xformer.theta,
+          inputs,
+          paddings,
+          aux_vecs=context,
+          aux_paddings=context_paddings)
+
+      tf.global_variables_initializer().run()
+      output = sess.run(output)
+      self.assertAllCloseAccordingToType([[[-0.41714936, 1.89849663]] * batch,
+                                          [[1.24795163, -1.43194675]] * batch],
+                                         output)
 
 
 if __name__ == '__main__':

@@ -25,6 +25,7 @@ import tensorflow as tf
 from tensorflow.contrib.tpu.python.tpu import tpu_function
 from tensorflow.python.framework import function
 from tensorflow.python.ops import io_ops
+from tensorflow.python.tpu import tpu_embedding as tpu_embedding_lib
 from lingvo.core import base_layer
 from lingvo.core import input_generator_helper as ig_helper
 from lingvo.core import py_utils
@@ -33,7 +34,7 @@ from lingvo.core.ops import py_x_ops
 
 
 class BaseInputGenerator(base_layer.BaseLayer):
-  """The base input generator."""
+  """The abstract base input generator."""
 
   @classmethod
   def Params(cls):
@@ -60,6 +61,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
     super(BaseInputGenerator, self).__init__(params)
     self._made_tpu_infeed = False
     # parameter to tell the bprop one hot for all the files.
+    # TODO(ankurbpn): Initialize when using sources from mixed record yielders.
     self._bprop_onehot = tf.constant([1], dtype=tf.float32)
     # Each entry is a regular expression specifying the set of variables
     # to bprop per data source.
@@ -76,14 +78,19 @@ class BaseInputGenerator(base_layer.BaseLayer):
     """Get the current bprop type of the input generator batch."""
     return self._bprop_onehot
 
-  def InputBatchSize(self):
-    """Returns the batch size for the current step."""
+  def GlobalBatchSize(self):
+    """Returns the number of samples for the current step, used for stats."""
+    return self.params.batch_size * self.cluster.num_splits_per_client
+
+  def InfeedBatchSize(self):
+    """Returns the number of samples in InputBatch."""
     p = self.params
     cluster = self.cluster
-
+    # Here we do not call self.GlobalBatchSize() since it can be overridden,
+    # e.g., when packed inputs are used.
+    batch_per_input = p.batch_size * cluster.num_splits_per_client
     # If use_per_host_infeed, each input op is only responsible
     # for generating a subset of the whole batch.
-    batch_per_input = p.batch_size * cluster.num_splits_per_client
     if p.use_per_host_infeed and cluster.num_tpu_hosts > 0:
       tf.logging.info('batch_size %d cluster.num_tpu_hosts %d', batch_per_input,
                       cluster.num_tpu_hosts)
@@ -115,7 +122,18 @@ class BaseInputGenerator(base_layer.BaseLayer):
     p = self.params
     cluster = self.cluster
     num_tpu_hosts = cluster.num_tpu_hosts
+    num_cores_per_host = cluster.total_worker_devices // num_tpu_hosts
+    tf.logging.info('num_cores_per_host {}'.format(num_cores_per_host))
+    tf.logging.info('num_devices_per_split {}'.format(
+        cluster.num_devices_per_split))
+
     assert num_tpu_hosts > 0, ('num_tpu_hosts: %d' % num_tpu_hosts)
+    if (cluster.num_devices_per_split > num_cores_per_host and
+        p.use_per_host_infeed):
+      tf.logging.fatal(
+          'Doesn\'t support per host infeed mode when '
+          'num_devices_per_split({}) > num_cores_per_host({})'.format(
+              cluster.num_devices_per_split, num_cores_per_host))
     num_infeed_hosts = num_tpu_hosts if p.use_per_host_infeed else 1
 
     with py_utils.outside_all_rewrites():
@@ -127,13 +145,46 @@ class BaseInputGenerator(base_layer.BaseLayer):
       input_ops_list = []
       queues = []
       first_batch = None
+      tpu_embedding_collection = tf.get_collection(py_utils.TPU_EMBEDDING)
+      tpu_embedding = (tpu_embedding_collection[0]
+                       if tpu_embedding_collection else None)
+
+      tpu_embedding_input_keys = (
+          tpu_embedding.feature_to_config_dict.keys()
+          if tpu_embedding is not None else [])
+
       for task_id in range(num_infeed_hosts):
         host_device = '/task:{}/device:CPU:0'.format(task_id)
         with tf.device(host_device):
           batch = self.GetPreprocessedInputBatch()
+          tpu_embedding_features = []
+          for tpu_embedding_input_key in tpu_embedding_input_keys:
+            tpu_embedding_feature = batch.pop(tpu_embedding_input_key)
+            tpu_embedding_features.append(
+                (tpu_embedding_input_key, tpu_embedding_feature))
+
           if first_batch is None:
             first_batch = batch
           flat_batch = batch.FlattenItems()
+
+          if tpu_embedding is not None:
+            enqueue_dict_per_core = [
+                {} for _ in range(tpu_embedding.num_cores_per_host)
+            ]
+            num_cores_per_host = tpu_embedding.num_cores_per_host
+            for tpu_embedding_input_key, tpu_embedding_feature in tpu_embedding_features:
+              tpu_embedding_feature_splitted = tf.split(tpu_embedding_feature,
+                                                        num_cores_per_host)
+              for core, split in enumerate(tpu_embedding_feature_splitted):
+                # Dense to sparse. Note the assumption of a padding id.
+                sample_indices = tf.where(tf.not_equal(split, -1))
+                embedding_indices = tf.gather_nd(split, sample_indices)
+                enqueue_data = tpu_embedding_lib.EnqueueData(
+                    embedding_indices, sample_indices)
+                enqueue_dict_per_core[core][
+                    tpu_embedding_input_key] = enqueue_data
+            input_ops_list += tpu_embedding.generate_enqueue_ops(
+                enqueue_dict_per_core)
 
           shapes, types = [], []
           for k, x in flat_batch:
@@ -179,7 +230,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
     for _ in range(p.tpu_infeed_parallism):
       tf.add_to_collection(py_utils.ENQUEUE_OPS, tpu_infeed_op)
 
-    with tf.device(tf.contrib.tpu.core(0)):
+    with tf.device(tf.compat.v1.tpu.core(0)):
       tensors = queues[0].generate_dequeue_op()
     return first_batch.Pack(tensors)
 
@@ -219,7 +270,11 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
     """Defaults params for input generators."""
     p = super(BaseInputGeneratorFromFiles, cls).Params()
     p.Define(
-        'file_pattern', '',
+        # TODO(tilarids): Consider renaming this param to make it clear it may
+        # be a set of file patterns with weights and filters and not just a
+        # simple string pattern.
+        'file_pattern',
+        '',
         'A single file pattern string, a list of <file_pattern, weight> pairs'
         'or a list of  <file_pattern, weight, bprop_variable_filter> tuples.'
         'In the later 2 cases, probablistic samples are from the inputs '
@@ -234,10 +289,26 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
         'record is about 500KB, the buffer needs 5GB ram.')
     p.Define('file_parallelism', 16, 'How many files to read concurrently.')
     p.Define(
+        'bucket_adjust_every_n', 0, 'If non-zero, optimize the values of '
+        'bucket_upper_bound except the last one after every N records '
+        'based on the current input length distribution.')
+    p.Define(
         'flush_every_n', 0, 'If non-zero, flushes all batches buffered '
         'so far every these many records are yielded.')
     p.Define('num_batcher_threads', 1, 'Number of threads to use for input '
              'record batcher.')
+    p.Define(
+        'require_sequential_order', False,
+        'If true, the input op is required to process the file glob as '
+        'well as the contents of each file in a deterministic sequential order.'
+        ' This is intended for unit tests. Setting this automatically disables '
+        'file_random_seed, file_buffer_size, file_parallelism, '
+        'num_batcher_threads, and requires a single file_pattern.')
+    p.Define(
+        'use_within_batch_mixing', False, 'Whether to mix records from '
+        'different input sources within batch or across batches (the '
+        'default option). This option only takes effect when file_pattern'
+        ' is a list of file patterns with weights.')
     return p
 
   @base_layer.initializer
@@ -252,16 +323,13 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
     p = self.params
     args = super(BaseInputGeneratorFromFiles, self).CommonInputOpArgs()
     args.update({
-        'file_random_seed':
-            p.file_random_seed,
-        'file_buffer_size':
-            p.file_buffer_size,
-        'file_parallelism':
-            p.file_parallelism,
-        'flush_every_n':
-            p.flush_every_n,
-        'num_threads':
-            p.num_batcher_threads,
+        'file_random_seed': p.file_random_seed,
+        'file_buffer_size': p.file_buffer_size,
+        'file_parallelism': p.file_parallelism,
+        'bucket_adjust_every_n': p.bucket_adjust_every_n,
+        'flush_every_n': p.flush_every_n,
+        'num_threads': p.num_batcher_threads,
+        'require_sequential_order': p.require_sequential_order,
     })
     args.update(self._InputOpBucketingArgs())
     return args
@@ -269,25 +337,31 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
   def _InputOpBucketingArgs(self):
     return {
         'bucket_upper_bound': [1000000000],
-        'bucket_batch_limit': [self.InputBatchSize()],
+        'bucket_batch_limit': [self.InfeedBatchSize()],
     }
 
-  def _DataSourceFromFilePattern(self, file_pattern):
+  def _DataSourceFromFilePattern(self, file_pattern, input_source_weights=None):
     """Read and return input batch from a string file_pattern.
 
     Args:
       file_pattern: A string file pattern.
+      input_source_weights: A list of float input source weights to control
+        input example mix in the batch. The records will be sampled from inputs
+        proportionally to these weights. Defaults to None which should be
+        treated as an empty list.
 
     Returns:
-      A tf.Tensor or `.NestedMap` of tf.Tensor
+      A tuple of tf.Tensors where the tensors which contain the input data and
+      have major dimension same as size of input batch.
     """
     raise NotImplementedError()
 
-  def _BuildDataSource(self):
-    """Read and return input batch from `p.file_pattern`.
+  def _BuildWithinBatchMixingDataSource(self):
+    """Read and return input batch from a p.file_pattern list.
 
-    `p.file_pattern` may be a string file_pattern or a
-    list of (file_pattern, weight) pairs.
+    `p.file_pattern` should be a list of (file_pattern, weight) pairs. Examples
+    in the batch will be mixed together from different file_pattern source
+    proportionally to the weights.
 
     Returns:
       A tf.Tensor or `.NestedMap` of tf.Tensor same as
@@ -297,31 +371,121 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
       ValueError: If unknown token type.
     """
     p = self.params
+    if not isinstance(p.file_pattern, list):
+      raise ValueError('Expected a list, got %s' % (p.file_pattern,))
+    if max(map(len, p.file_pattern)) >= 3:
+      # Within batch mixing doesn't work with backprop filters, i.e. when
+      # file_pattern param contains a list of
+      # <file_pattern, weight, [bprop_variable_filter]> tuples.
+      raise ValueError('Expected a list of pairs, got %s' % (p.file_pattern,))
+
+    file_patterns, weights = zip(*p.file_pattern)
+    self._bprop_variable_filters = [''] * len(file_patterns)
+    for file_pattern in file_patterns:
+      if ',' in file_pattern:
+        raise ValueError('Can not use commas in file_pattern when within-batch '
+                         'mixing is used. file_pattern: %s' % (file_pattern,))
+
+    # Do not set self._bprop_onehot as it shouldn't be used later on.
+    try:
+      return self._DataSourceFromFilePattern(','.join(file_patterns), weights)
+    except TypeError as e:
+      raise NotImplementedError(
+          'The function may not be fully implemented. Have you added ' +
+          'input_source_weights as params? Original exception: %s' % e)
+
+  def _BuildCrossBatchMixingDataSource(self):
+    """Read and return input batch from a p.file_pattern list.
+
+    `p.file_pattern` should be a list of (file_pattern, weight,
+    optional_bprop_filter) tuples. Every batch returned will be filled from one
+    source only and batches will be mixed proportionally to the weights.
+    Additionally some backprop filters may be applied for different input
+    sources.
+
+    Returns:
+      A tuple which contains the output of `self._DataSourceFromFilePattern()`
+      and a tensor of size [batch_size, number of data sources] which contains
+      the source selected for each element in the input batch. With cross batch
+      mixing the complete input batch comes from the same source.
+
+    Raises:
+      ValueError: If unknown token type.
+    """
+    p = self.params
     input_file_pattern = p.file_pattern
+
+    def _MakeDataSourceFromFilePatternFunc(file_pattern):
+      # It's important to invoke self._DataSourceFromFilePattern() inside the
+      # lambda to make sure that the record is drawn from data source
+      # only if it will be used.
+      return lambda: self._DataSourceFromFilePattern(file_pattern)
+
+    inputs = []
+    weights = []
+    self._bprop_variable_filters = []
+    for input_entry in input_file_pattern:
+      file_pattern, weight = input_entry[:2]
+      inputs.append(_MakeDataSourceFromFilePatternFunc(file_pattern))
+      weights.append(weight)
+      bprop_variable_filter = input_entry[2] if len(input_entry) > 2 else ''
+      self._bprop_variable_filters.append(bprop_variable_filter)
+    data_source, selected_bprop = py_utils.MixByWeight(inputs, weights)
+    # TODO(neerajgaur): Remove _bprop_onehot and change code that uses it to
+    # use source_selected from input_batch.
+    self._bprop_onehot = selected_bprop
+    batch_size = py_utils.GetShape(tf.nest.flatten(data_source)[0])[0]
+    return data_source, tf.tile(
+        tf.expand_dims(selected_bprop, 0), [batch_size, 1])
+
+  def _BuildDataSourceWithMetadata(self):
+    """Read and return input batch from `p.file_pattern`.
+
+    `p.file_pattern` may be a string file_pattern or a
+    list of (file_pattern, weight, [bprop_variable_filter]) tuples.
+    bprop_variable_filter is optional. When bprop_variable_filter is used,
+    batches will always contain the examples from the same source. Otherwise,
+    examples from different sources may be mixed together.
+
+    Returns:
+      A tuple of tf.Tensor or `.NestedMap` of tf.Tensor same as
+      `self._DataSourceFromFilePattern()` and a tensor of size
+      [batch_size, number of data sources] or None.
+
+    Raises:
+      ValueError: If unknown token type.
+    """
+    p = self.params
+    input_file_pattern = p.file_pattern
+    ret = py_utils.NestedMap()
     if isinstance(input_file_pattern, six.string_types):
-      data_source = self._DataSourceFromFilePattern(input_file_pattern)
+      data, source_selected = self._DataSourceFromFilePattern(
+          input_file_pattern), None
     elif isinstance(input_file_pattern, list):
-      # Handle weighted input file patterns, where input_file_patterns contain
-      # a list of <file_pattern, weight> pairs.
-      def _MakeDataSourceFromFilePatternFunc(file_pattern):
-        # It's important to invoke self._DataSourceFromFilePattern() inside the
-        # lambda to make sure that the record is drawn from data source
-        # only if it will be used.
-        return lambda: self._DataSourceFromFilePattern(file_pattern)
-      inputs = []
-      weights = []
-      self._bprop_variable_filters = []
-      for input_entry in input_file_pattern:
-        file_pattern, weight = input_entry[:2]
-        inputs.append(_MakeDataSourceFromFilePatternFunc(file_pattern))
-        weights.append(weight)
-        bprop_variable_filter = input_entry[2] if len(input_entry) > 2 else ''
-        self._bprop_variable_filters.append(bprop_variable_filter)
-      data_source, selected_bprop = py_utils.MixByWeight(inputs, weights)
-      self._bprop_onehot = selected_bprop
+      if p.use_within_batch_mixing:
+        data, source_selected = self._BuildWithinBatchMixingDataSource(), None
+      else:
+        # Otherwise fall back to MixByWeight-based approach.
+        data, source_selected = self._BuildCrossBatchMixingDataSource()
     else:
       raise ValueError()
-    return data_source
+    ret.data = data
+    ret.source_selected = source_selected
+    return ret
+
+  def _BuildDataSource(self):
+    """Read and return input batch from `p.file_pattern`.
+
+    Same as _BuildDataSourceWithMetadata but does not return any metadata.
+
+    Returns:
+      A tuple of tf.Tensor or `.NestedMap` of tf.Tensor same as
+      `self._DataSourceFromFilePattern()`.
+
+    Raises:
+      ValueError: If unknown token type.
+    """
+    return self._BuildDataSourceWithMetadata()['data']
 
 
 class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
@@ -374,7 +538,8 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
       else:
         self.tokenizer_dict[k] = None
 
-    self.tokenizer = self.tokenizer_dict['default']
+    if 'default' in self.tokenizer_dict:
+      self.tokenizer = self.tokenizer_dict['default']
 
   @property  # Adjust batch size according to the cluster spec.
   def scaled_bucket_batch_limit(self):
@@ -390,10 +555,26 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
         ]
     return self._scaled_bucket_batch_limit
 
-  def InputBatchSize(self):
+  def GlobalBatchSize(self):
+    # TODO(rpang): rename self._input_batch_size to _global_input_batch_size.
     if self._input_batch_size is None:
       raise ValueError('No input batch size is defined.')
     return self._input_batch_size
+
+  def InfeedBatchSize(self):
+    p = self.params
+    cluster = self.cluster
+    if self._input_batch_size is None:
+      raise ValueError('No input batch size is defined.')
+    batch_per_input = self._input_batch_size
+    # If use_per_host_infeed, each input op is only responsible
+    # for generating a subset of the whole batch.
+    if p.use_per_host_infeed and cluster.num_tpu_hosts > 0:
+      tf.logging.info('batch_size %d cluster.num_tpu_hosts %d', batch_per_input,
+                      cluster.num_tpu_hosts)
+      batch_per_input //= cluster.num_tpu_hosts
+    tf.logging.info('batch_per_input: %d', batch_per_input)
+    return batch_per_input
 
   def _InputOpBucketingArgs(self):
     p = self.params
@@ -409,7 +590,8 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
                    is_source=False,
                    external_max_length=None,
                    external_append_eos=None,
-                   key=None):
+                   key=None,
+                   languages=None):
     """Tokenize strs into vocab ids.
 
     Args:
@@ -421,6 +603,7 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
         `params.append_eos` will be used. If bool, will determine if an eos
         symbol will be added to tokens.
       key: A string key in case the model has multiple tokenizers.
+      languages: A vector of str with the same length as `strs`.
 
     Returns:
       A tuple (ids, labels, paddings) with the same shape [batch, maxlen].
@@ -442,8 +625,8 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
       maxlen = p.target_max_length
 
     key = key or 'default'
-    return self.tokenizer_dict[key].StringsToIds(strs, maxlen,
-                                                 external_append_eos)
+    return self.tokenizer_dict[key].StringsToIds(
+        strs, maxlen, external_append_eos, languages=languages)
 
   def IdsToStrings(self, ids, lens, key=None):
     """Converts ids back to strings.
@@ -452,8 +635,8 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
       ids: A matrix of shape [batch, seqlen]. ids[i, :] is the i-th sample's
         ids.
       lens: A vector of shape [batch]. lens[i] is the sequence length of the
-        i-th sample. Only the first lens[i] tokens in ids[i, :] are valid
-        tokens for the i-th sequence.
+        i-th sample. Only the first lens[i] tokens in ids[i, :] are valid tokens
+        for the i-th sequence.
       key: A string key in case the model has multiple tokenizers.
 
     Returns:
@@ -505,7 +688,7 @@ class BaseTinyDatasetInput(BaseInputGenerator):
 
     # Loads data and label into memory and keep it around.
     data, label = py_x_ops.cached_call(f=ReadData, T=[tf.float32, tf.float32])
-    b, shape = self.InputBatchSize(), list(p.data_shape)
+    b, shape = self.InfeedBatchSize(), list(p.data_shape)
     data = tf.reshape(data, [-1] + shape)
     label = tf.reshape(label, [-1])
     label = py_utils.HasShape(label, [tf.shape(data)[0]])
@@ -527,3 +710,92 @@ class BaseTinyDatasetInput(BaseInputGenerator):
 
   def _Preprocess(self, raw):
     return raw
+
+
+class BaseDataExampleInputGenerator(BaseInputGenerator):
+  """Base class for input generators that read Feature protos via tf.data."""
+
+  @classmethod
+  def Params(cls):
+    p = super(BaseDataExampleInputGenerator, cls).Params()
+    p.Define('input_files', None, 'Delimited glob of input files.')
+    p.Define(
+        'dataset_type', None,
+        'A dataset class constructor such as tf.data.TFRecordDatatset. '
+        'The class constructor must take a list of filenames and produce an '
+        'object that extends tf.data.Dataset.')
+    p.Define('randomize_order', True, 'Whether to randomize the order.')
+    p.Define('parallel_readers', 1, 'Number of parallel reader threads.')
+    p.Define('num_examples', -1, 'Number of examples (-1 for unlimited).')
+    p.Define('randomize_shuffle_size', 500,
+             'Size of the random shuffle buffer.')
+    return p
+
+  def __init__(self, params):
+    super(BaseDataExampleInputGenerator, self).__init__(params)
+    p = params
+    assert p.input_files, (
+        'input_files is required for a tf.data example input generator')
+    assert p.dataset_type, (
+        'dataset_type is required for a tf.data example input generator')
+
+  def GetFeatureSpec(self):
+    """Subclasses must implement and return a feature spec.
+
+    Returns:
+      NestedMap of features compatible with tf.parse_example. Default
+      implementation returns an empty dict.
+    """
+    return {}
+
+  def PostProcessBatch(self, input_batch):
+    """Post processes an input batch.
+
+    By default, just returns the batch unchanged. This happens as part of the
+    parallel reader threads and can therefore be more efficient for performing
+    expensive operations vs doing work as the result of InputBatch().
+
+    Args:
+      input_batch: Input batch NestedMap.
+
+    Returns:
+      Altered batch NestedMap.
+    """
+    return input_batch
+
+  def InputBatch(self):
+    p = self.params
+
+    def ParseAndProcess(*cols):
+      """Parses a Tensorflow example into features."""
+      # Assume either one or two column input. If one, then the record is
+      # assumed to be that column. If 2, then it is assumed to be a KV store
+      # and the record is the second column.
+      assert len(cols) in [
+          1, 2
+      ], ('BaseExampleInputGenerator supports one or two column input')
+      record = cols[-1]
+      feature_spec = self.GetFeatureSpec()
+      features = py_utils.NestedMap(tf.parse_example(record, feature_spec))
+      return self.PostProcessBatch(features)
+
+    dataset_factory = p.dataset_type
+    dataset = (
+        tf.data.Dataset.list_files(
+            p.input_files, shuffle=bool(p.randomize_order)).apply(
+                tf.data.experimental.parallel_interleave(
+                    dataset_factory,
+                    cycle_length=p.parallel_readers,
+                    sloppy=p.randomize_order)))
+
+    if p.randomize_order:
+      dataset = dataset.shuffle(p.randomize_shuffle_size)
+    dataset = dataset.take(p.num_examples)
+    dataset = dataset.repeat()
+    dataset = dataset.batch(p.batch_size, drop_remainder=True)
+    dataset = dataset.map(
+        ParseAndProcess, num_parallel_calls=p.parallel_readers)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+    iterator = dataset.make_one_shot_iterator()
+    input_batch = iterator.get_next()
+    return input_batch

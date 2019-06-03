@@ -4,14 +4,19 @@ package(
 
 licenses(["notice"])  # Apache 2.0
 
+filegroup(
+    name = "brown_corpus_wpm_data",
+    srcs = glob(include = ["brown_corpus_wpm.*"]),
+)
+
 py_library(
     name = "codelab",
     srcs = ["codelab.py"],
+    data = [":brown_corpus_wpm_data"],
     deps = [
+        # Implicit tensorflow dependency.
         "//lingvo:model_registry",
         "//lingvo/core:base_model_params",
-        "//lingvo/core:lr_schedule",
-        "//lingvo/core:optimizer",
         "//lingvo/tasks/mt/params",
         "//lingvo/tasks/punctuator:input_generator",
         "//lingvo/tasks/punctuator:model",

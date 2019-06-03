@@ -12,6 +12,7 @@ load(
 py_binary(
     name = "keras2ckpt",
     srcs = ["keras2ckpt.py"],
+    python_version = "PY2",
     deps = [
         # Implicit tensorflow dependency.
     ],
@@ -20,6 +21,7 @@ py_binary(
 py_binary(
     name = "bpe_word_tokenizer",
     srcs = ["bpe_word_tokenizer.py"],
+    python_version = "PY2",
     deps = [
         # Implicit tensorflow dependency.
     ],
@@ -28,7 +30,21 @@ py_binary(
 py_binary(
     name = "wpm_encode_file",
     srcs = ["wpm_encode_file.py"],
+    python_version = "PY2",
+    deps = [":wpm_encode_file_main_lib"],
+)
+
+py_library(
+    name = "wpm_encode_file_main_lib",
+    srcs = ["wpm_encode_file.py"],
+    deps = [":wpm_encode_file_lib"],
+)
+
+py_library(
+    name = "wpm_encode_file_lib",
+    srcs = ["wpm_encode_file.py"],
     deps = [
+        # Implicit numpy dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:wpm_encoder",
     ],
@@ -37,6 +53,7 @@ py_binary(
 py_binary(
     name = "print_tf_records",
     srcs = ["print_tf_records.py"],
+    python_version = "PY2",
     deps = [
         # Implicit tensorflow dependency.
     ],
@@ -45,6 +62,7 @@ py_binary(
 py_binary(
     name = "compute_stats",
     srcs = ["compute_stats.py"],
+    python_version = "PY2",
     deps = [
         # Implicit tensorflow dependency.
     ],
@@ -54,7 +72,9 @@ py_library(
     name = "audio_lib",
     srcs = ["audio_lib.py"],
     deps = [
+        # Additional FFT kernels dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/tasks/asr:frontend",
     ],
 )
 
@@ -64,20 +84,22 @@ py_test(
     data = [
         "//lingvo/tools/testdata:audio_data",
     ],
+    python_version = "PY2",
     deps = [
         ":audio_lib",
         # Implicit tensorflow dependency.
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
 py_binary(
     name = "create_asr_features",
     srcs = ["create_asr_features.py"],
+    python_version = "PY2",
     deps = [
         ":audio_lib",
         # Implicit tensorflow dependency.
-        "//lingvo/core:asr_frontend",
     ],
 )
 
@@ -85,6 +107,7 @@ lingvo_cc_binary(
     name = "generate_proto_def",
     srcs = ["generate_proto_def.cc"],
     deps = [
+        # Implicit proto dependency.
         # Implicit tensorflow proto dependency.
     ],
 )

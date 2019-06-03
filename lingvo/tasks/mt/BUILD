@@ -19,7 +19,15 @@ py_library(
 py_test(
     name = "layers_test",
     srcs = ["layers_test.py"],
+    python_version = "PY2",
     shard_count = 2,
+    deps = [":layers_test_lib"],
+)
+
+py_library(
+    name = "layers_test_lib",
+    testonly = True,
+    srcs = ["layers_test.py"],
     deps = [
         ":layers",
         # Implicit numpy dependency.
@@ -27,6 +35,7 @@ py_test(
         # Implicit tensorflow dependency.
         "//lingvo/core:layers_with_attention",
         "//lingvo/core:py_utils",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -50,12 +59,14 @@ py_library(
 py_test(
     name = "encoder_test",
     srcs = ["encoder_test.py"],
+    python_version = "PY2",
     shard_count = 12,
     deps = [
         ":encoder",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:py_utils",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -84,7 +95,15 @@ py_library(
 py_test(
     name = "decoder_test",
     srcs = ["decoder_test.py"],
+    python_version = "PY2",
     shard_count = 20,
+    deps = [":decoder_test_lib"],
+)
+
+py_library(
+    name = "decoder_test_lib",
+    testonly = True,
+    srcs = ["decoder_test.py"],
     deps = [
         ":decoder",
         # Implicit numpy dependency.
@@ -95,6 +114,7 @@ py_test(
         "//lingvo/core:layers",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
+        "//lingvo/core/ops:hyps_py_pb2",
     ],
 )
 
@@ -106,9 +126,9 @@ py_library(
         # Implicit tensorflow dependency.
         "//lingvo/core:base_input_generator",
         "//lingvo/core:base_layer",
+        "//lingvo/core:generic_input",
         "//lingvo/core:py_utils",
         "//lingvo/core:tokenizers",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
@@ -118,6 +138,7 @@ py_test(
     data = [
         "//lingvo/tasks/mt/testdata:wmt14_ende_tfexample",
     ],
+    python_version = "PY2",
     deps = [
         ":input_generator",
         # Implicit numpy dependency.
@@ -125,6 +146,7 @@ py_test(
         # Implicit tensorflow dependency.
         "//lingvo/core:py_utils",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -146,25 +168,36 @@ py_library(
 
 py_test(
     name = "model_test",
+    size = "large",
+    srcs = ["model_test.py"],
+    python_version = "PY2",
+    shard_count = 20,
+    deps = [":model_test_lib"],
+)
+
+py_library(
+    name = "model_test_lib",
+    testonly = True,
     srcs = ["model_test.py"],
     data = [
         "//lingvo/tasks/mt/testdata:wmt14_ende_tfexample",
     ],
-    shard_count = 20,
     deps = [
         ":decoder",
         ":encoder",
         ":input_generator",
         ":model",
+        # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:base_input_generator",
         "//lingvo/core:base_layer",
         "//lingvo/core:cluster_factory",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:optimizer",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 

@@ -26,6 +26,7 @@ from six.moves import zip
 import tensorflow as tf
 from google.protobuf import text_format
 
+from lingvo.core import cluster_factory
 from lingvo.core import layers as lingvo_layers
 from lingvo.core import py_utils
 from lingvo.core import test_utils
@@ -35,7 +36,7 @@ from lingvo.tasks.asr import decoder
 FLAGS = tf.flags.FLAGS
 
 
-class DecoderTest(tf.test.TestCase):
+class DecoderTest(test_utils.TestCase):
 
   def _DecoderParams(self,
                      vn_config,
@@ -43,9 +44,10 @@ class DecoderTest(tf.test.TestCase):
                      num_rnn_layers=1):
     """Create a small decoder for testing."""
     p = decoder.AsrDecoder.Params()
+    p.random_seed = 12345
 
     p.name = 'decoder'
-    uniform_init = py_utils.WeightInit.Uniform(0.1)
+    uniform_init = py_utils.WeightInit.Uniform(0.1, seed=12345)
 
     # Set up embedding params.
     p.emb.vocab_size = num_classes
@@ -86,6 +88,8 @@ class DecoderTest(tf.test.TestCase):
     src_enc_padding = tf.constant(
         [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
         dtype=py_utils.FPropDtype(params))
+    encoder_outputs = py_utils.NestedMap(
+        encoded=src_enc, padding=src_enc_padding)
     # shape=[4, 5]
     target_ids = tf.transpose(
         tf.constant([[0, 1, 2, 3], [1, 2, 3, 4], [10, 11, 12, 15], [5, 6, 7, 8],
@@ -112,7 +116,7 @@ class DecoderTest(tf.test.TestCase):
         'transcripts': target_transcripts,
     })
     metrics, per_sequence_loss = dec.FPropWithPerExampleLoss(
-        src_enc, src_enc_padding, targets, None)
+        encoder_outputs, targets)
     loss = metrics['loss']
 
     return loss, per_sequence_loss
@@ -123,23 +127,27 @@ class DecoderTest(tf.test.TestCase):
                                    target_seq_len=5,
                                    residual_start=0):
     """Computes decoder from params and computes loss with random inputs."""
+    cluster = cluster_factory.ForTestingWorker(add_summary=True)
     config = tf.ConfigProto(
         graph_options=tf.GraphOptions(
             optimizer_options=tf.OptimizerOptions(
                 do_function_inlining=func_inline)))
-    with self.session(graph=tf.Graph(), use_gpu=False, config=config) as sess:
+    with cluster, self.session(
+        graph=tf.Graph(), use_gpu=False, config=config) as sess:
       tf.set_random_seed(8372749040)
       vn_config = py_utils.VariationalNoiseParams(None, False, False)
       p = self._DecoderParams(vn_config)
       p.rnn_layers = num_decoder_layers
       p.residual_start = residual_start
       p.target_seq_len = target_seq_len
-      dec = p.cls(p)
+      dec = p.Instantiate()
       src_seq_len = 5
       src_enc = tf.random_normal([src_seq_len, 2, 8], seed=9283748)
       src_enc_padding = tf.constant(
           [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
           dtype=tf.float32)
+      encoder_outputs = py_utils.NestedMap(
+          encoded=src_enc, padding=src_enc_padding)
       target_ids = tf.transpose(
           tf.constant([[0, 1, 2, 3], [1, 2, 3, 4], [10, 11, 12, 15],
                        [5, 6, 7, 8], [10, 5, 2, 5]],
@@ -161,7 +169,7 @@ class DecoderTest(tf.test.TestCase):
           'paddings': target_paddings,
           'transcripts': target_transcripts,
       })
-      metrics = dec.FPropDefaultTheta(src_enc, src_enc_padding, targets, None)
+      metrics = dec.FPropDefaultTheta(encoder_outputs, targets)
       loss = metrics['loss'][0]
       correct_predicts = metrics['fraction_of_correct_next_step_preds'][0]
       summaries = tf.summary.merge(tf.get_collection(tf.GraphKeys.SUMMARIES))
@@ -233,7 +241,7 @@ class DecoderTest(tf.test.TestCase):
 
   def testDecoderFPropDeterministicAttentionDropout(self):
     """Verify that attention dropout is deterministic given fixed seeds."""
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False, graph=tf.Graph()) as sess:
       tf.set_random_seed(8372749040)
       p = self._DecoderParams(
           py_utils.VariationalNoiseParams(None, True, False, seed=1792))
@@ -243,36 +251,28 @@ class DecoderTest(tf.test.TestCase):
       p.attention.atten_dropout_deterministic = True
 
       loss, per_sequence_loss = self._testDecoderFPropHelper(params=p)
-      global_step = tf.train.get_global_step()
+      global_step = py_utils.GetGlobalStep()
       tf.global_variables_initializer().run()
-      loss_val, per_sequence_loss_val, global_steps_val, time_steps_val = (
-          sess.run([
-              loss, per_sequence_loss, 'decoder_1/accumulated_global_steps:0',
-              'decoder_1/accumulated_time_steps:0'
-          ]))
+      loss_val, per_sequence_loss_val, global_steps_val = sess.run(
+          [loss, per_sequence_loss, global_step])
 
       print('loss = ', loss_val, 'per sequence loss = ', per_sequence_loss_val)
-      self.assertAllClose([3.473008, 15.0], loss_val)
-      self.assertAllClose([13.563036, 10.053869, 10.362661, 18.115553],
+      self.assertAllClose([3.587372, 15.0], loss_val)
+      self.assertAllClose([14.171288, 9.965696, 10.221684, 19.451914],
                           per_sequence_loss_val)
-      self.assertAllEqual([0, 0, 0, 0, 0], global_steps_val)
-      self.assertAllEqual([1, 2, 3, 4, 5], time_steps_val)
+      self.assertEqual(0, global_steps_val)
 
       # Run another step to test global_step and time_step are incremented
       # correctly.
       sess.run(tf.assign_add(global_step, 1))
-      loss_val, per_sequence_loss_val, global_steps_val, time_steps_val = (
-          sess.run([
-              loss, per_sequence_loss, 'decoder_1/accumulated_global_steps:0',
-              'decoder_1/accumulated_time_steps:0'
-          ]))
+      loss_val, per_sequence_loss_val, global_steps_val = sess.run(
+          [loss, per_sequence_loss, global_step])
 
       print('loss = ', loss_val, 'per sequence loss = ', per_sequence_loss_val)
-      self.assertAllClose([3.567736, 15.0], loss_val)
-      self.assertAllClose([14.730419, 10.176270, 10.73501, 17.87434578],
+      self.assertAllClose([3.626164, 15.0], loss_val)
+      self.assertAllClose([14.70993, 10.572938, 10.516836, 18.592758],
                           per_sequence_loss_val)
-      self.assertAllEqual([1, 1, 1, 1, 1], global_steps_val)
-      self.assertAllEqual([1, 2, 3, 4, 5], time_steps_val)
+      self.assertEqual(1, global_steps_val)
 
   def testLabelSmoothing(self):
     """Verify that loss computation with label smoothing is as expected.."""
@@ -289,35 +289,35 @@ class DecoderTest(tf.test.TestCase):
       loss_val = sess.run(loss[0])
 
       print('loss = ', loss_val)
-      self.assertAllClose(loss_val, 3.449249)
+      test_utils.CompareToGoldenSingleFloat(self, 3.471763, loss_val)
 
   def testDecoderFPropFloatNoInline(self):
     actual_value = self._testDecoderFPropFloatHelper(func_inline=False)
-    test_utils.CompareToGoldenSingleFloat(self, 3.512219, actual_value)
+    test_utils.CompareToGoldenSingleFloat(self, 3.458980, actual_value)
 
   def testDecoderFPropFloatNoInlinePadTargetsToLongerLength(self):
     actual_value = self._testDecoderFPropFloatHelper(
         func_inline=False, target_seq_len=10)
-    test_utils.CompareToGoldenSingleFloat(self, 3.512219, actual_value)
+    test_utils.CompareToGoldenSingleFloat(self, 3.458980, actual_value)
 
   def testDecoderFPropFloatInline(self):
     actual_value = self._testDecoderFPropFloatHelper(func_inline=True)
-    test_utils.CompareToGoldenSingleFloat(self, 3.512219, actual_value)
+    test_utils.CompareToGoldenSingleFloat(self, 3.458980, actual_value)
 
   def testDecoderFPropFloatNoInline2Layers(self):
     actual_value = self._testDecoderFPropFloatHelper(
         func_inline=False, num_decoder_layers=2)
-    test_utils.CompareToGoldenSingleFloat(self, 3.512603, actual_value)
+    test_utils.CompareToGoldenSingleFloat(self, 3.457761, actual_value)
 
   def testDecoderFPropFloatInline2Layers(self):
     actual_value = self._testDecoderFPropFloatHelper(
         func_inline=True, num_decoder_layers=2)
-    test_utils.CompareToGoldenSingleFloat(self, 3.512603, actual_value)
+    test_utils.CompareToGoldenSingleFloat(self, 3.457761, actual_value)
 
   def testDecoderFPropFloat2LayersResidual(self):
     actual_value = self._testDecoderFPropFloatHelper(
         num_decoder_layers=2, residual_start=2)
-    test_utils.CompareToGoldenSingleFloat(self, 3.513235, actual_value)
+    test_utils.CompareToGoldenSingleFloat(self, 3.458294, actual_value)
 
   def testDecoderFPropDouble(self):
     with self.session(use_gpu=False):
@@ -356,14 +356,16 @@ class DecoderTest(tf.test.TestCase):
           'paddings': target_paddings,
           'transcripts': target_transcripts,
       })
-      metrics = dec.FPropDefaultTheta(src_enc, src_enc_padding, targets, None)
+      encoder_outputs = py_utils.NestedMap(
+          encoded=src_enc, padding=src_enc_padding)
+      metrics = dec.FPropDefaultTheta(encoder_outputs, targets)
       loss = metrics['loss'][0]
 
       tf.global_variables_initializer().run()
 
-      test_utils.CompareToGoldenSingleFloat(self, 3.483581, loss.eval())
+      test_utils.CompareToGoldenSingleFloat(self, 3.467679, loss.eval())
       # Second run to make sure the function is determistic.
-      test_utils.CompareToGoldenSingleFloat(self, 3.483581, loss.eval())
+      test_utils.CompareToGoldenSingleFloat(self, 3.467679, loss.eval())
 
   def _testDecoderFPropGradientCheckerHelper(self, func_inline=False):
     config = tf.ConfigProto(
@@ -377,13 +379,15 @@ class DecoderTest(tf.test.TestCase):
       p = self._DecoderParams(vn_config)
       p.dtype = tf.float64
 
-      dec = p.cls(p)
+      dec = p.Instantiate()
       src_seq_len = 5
       src_enc = tf.constant(
           np.random.uniform(size=(src_seq_len, 2, 8)), tf.float64)
       src_enc_padding = tf.constant(
           [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
           dtype=tf.float64)
+      encoder_outputs = py_utils.NestedMap(
+          encoded=src_enc, padding=src_enc_padding)
       target_ids = tf.transpose(
           tf.constant([[0, 1, 2, 3], [1, 2, 3, 4], [10, 11, 12, 15],
                        [5, 6, 7, 8], [10, 5, 2, 5]],
@@ -406,9 +410,9 @@ class DecoderTest(tf.test.TestCase):
           'paddings': target_paddings,
           'transcripts': target_transcripts,
       })
-      metrics = dec.FPropDefaultTheta(src_enc, src_enc_padding, targets, None)
+      metrics = dec.FPropDefaultTheta(encoder_outputs, targets)
       loss = metrics['loss'][0]
-      all_vars = tf.all_variables()
+      all_vars = tf.trainable_variables()
       grads = tf.gradients(loss, all_vars)
 
       def DenseGrad(var, grad):
@@ -422,9 +426,9 @@ class DecoderTest(tf.test.TestCase):
 
       tf.global_variables_initializer().run()
 
-      test_utils.CompareToGoldenSingleFloat(self, 3.493656, loss.eval())
+      test_utils.CompareToGoldenSingleFloat(self, 3.458078, loss.eval())
       # Second run to make sure the function is determistic.
-      test_utils.CompareToGoldenSingleFloat(self, 3.493656, loss.eval())
+      test_utils.CompareToGoldenSingleFloat(self, 3.458078, loss.eval())
 
       symbolic_grads = [x.eval() for x in dense_grads if x is not None]
       numerical_grads = []
@@ -455,7 +459,7 @@ class DecoderTest(tf.test.TestCase):
       p.dtype = tf.float32
       p.target_seq_len = 5
       p.is_eval = True
-      dec = p.cls(p)
+      dec = p.Instantiate()
       if src_seq_len is None:
         src_seq_len = 5
       src_enc = tf.constant(
@@ -465,7 +469,9 @@ class DecoderTest(tf.test.TestCase):
             [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
             dtype=tf.float32)
 
-      done_hyps = dec.BeamSearchDecode(src_enc, src_enc_padding).done_hyps
+      encoder_outputs = py_utils.NestedMap(
+          encoded=src_enc, padding=src_enc_padding)
+      done_hyps = dec.BeamSearchDecode(encoder_outputs).done_hyps
       tf.global_variables_initializer().run()
 
       softmax_wts = sess.run(dec.vars.softmax)
@@ -503,30 +509,30 @@ class DecoderTest(tf.test.TestCase):
 
     expected_str = """
       beam_id: 1
-      ids: 4
+      ids: 0
       ids: 6
       ids: 2
-      scores: -1.99632573128
-      scores: -1.99929893017
-      scores: -1.95849049091
+      scores: -2.021608
+      scores: -2.000098
+      scores: -2.036338
       atten_vecs {
-        prob: 0.332584857941
-        prob: 0.333580821753
-        prob: 0.333834320307
+        prob: 0.330158
+        prob: 0.342596
+        prob: 0.327246
         prob: 0.0
         prob: 0.0
       }
       atten_vecs {
-        prob: 0.33258497715
-        prob: 0.333580613136
-        prob: 0.333834379911
+        prob: 0.330158
+        prob: 0.342597
+        prob: 0.327245
         prob: 0.0
         prob: 0.0
       }
       atten_vecs {
-        prob: 0.332585155964
-        prob: 0.333580434322
-        prob: 0.333834439516
+        prob: 0.330158
+        prob: 0.342597
+        prob: 0.327245
         prob: 0.0
         prob: 0.0
       }
@@ -536,6 +542,67 @@ class DecoderTest(tf.test.TestCase):
 
     decoded_hyp = self._testDecoderBeamSearchDecodeHelperWithOutput(params=p)
     self._VerifyHypothesesMatch(expected_hyp, decoded_hyp)
+
+  def testDecoderSampleTargetSequences(self):
+    p = self._DecoderParams(
+        vn_config=py_utils.VariationalNoiseParams(None, False, False),
+        num_classes=8)
+    p.target_seq_len = 5
+    p.random_seed = 1
+    config = tf.ConfigProto(
+        graph_options=tf.GraphOptions(
+            optimizer_options=tf.OptimizerOptions(do_function_inlining=False)))
+    with self.session(use_gpu=False, config=config) as sess:
+      tf.set_random_seed(8372740)
+      np.random.seed(35315)
+      dec = p.Instantiate()
+      source_sequence_length = 5
+      batch_size = 4
+      source_encodings = tf.constant(
+          np.random.normal(
+              size=[source_sequence_length, batch_size, p.source_dim]),
+          dtype=tf.float32)
+      source_encoding_padding = tf.constant(
+          [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 1.0, 1.0],
+           [0.0, 1.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0]],
+          dtype=tf.float32)
+      encoder_outputs = py_utils.NestedMap(
+          encoded=source_encodings, padding=source_encoding_padding)
+      sampled_sequences = dec.SampleTargetSequences(
+          dec.theta, encoder_outputs, random_seed=tf.to_int32(123))
+      self.assertAllEqual([batch_size, p.target_seq_len],
+                          sampled_sequences.ids.shape)
+      tf.global_variables_initializer().run()
+      decoder_output = sess.run(sampled_sequences)
+      print('ids=%s' % np.array_repr(decoder_output.ids))
+      lens = np.sum(1 - decoder_output.paddings, axis=1)
+      print('lens=%s' % lens)
+      # pyformat: disable
+      # pylint: disable=bad-whitespace,bad-continuation
+      expected_ids = [[6, 2, 2, 2, 2],
+                      [0, 0, 7, 5, 1],
+                      [6, 1, 5, 1, 5],
+                      [6, 7, 7, 4, 4]]
+      # pylint: enable=bad-whitespace,bad-continuation
+      # pyformat: enable
+      expected_lens = [2, 5, 5, 5]
+      self.assertAllEqual(expected_lens, lens)
+      self.assertAllEqual(expected_ids, decoder_output.ids)
+
+      # Sample again with the same random seed.
+      decoder_output2 = sess.run(
+          dec.SampleTargetSequences(
+              dec.theta, encoder_outputs, random_seed=tf.to_int32(123)))
+      # Get the same output.
+      self.assertAllEqual(decoder_output.ids, decoder_output2.ids)
+      self.assertAllEqual(decoder_output.paddings, decoder_output2.paddings)
+
+      # Sample again with a different random seed.
+      decoder_output3 = sess.run(
+          dec.SampleTargetSequences(
+              dec.theta, encoder_outputs, random_seed=tf.to_int32(123456)))
+      # Get different sequences.
+      self.assertNotAllClose(expected_ids, decoder_output3.ids)
 
 
 if __name__ == '__main__':

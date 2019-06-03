@@ -18,13 +18,19 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import six
+import numpy as np
 from six.moves import zip
-
 import tensorflow as tf
 
+from lingvo.core import plot
 from lingvo.core import py_utils
 from lingvo.core import scorers
+try:
+  # pylint: disable=g-import-not-at-top
+  import sklearn.metrics
+  HAS_SKLEARN = True
+except ImportError:
+  HAS_SKLEARN = False
 
 
 def CreateScalarSummary(name, simple_value):
@@ -89,7 +95,8 @@ class AverageMetric(BaseMetric):
 
   @property
   def value(self):
-    return self._total_value/self._total_weight if self._total_weight > 0 else 0
+    return (self._total_value /
+            self._total_weight if self._total_weight > 0 else 0)
 
 
 class F1Metric(BaseMetric):
@@ -166,11 +173,11 @@ class TpuEvalMetrics(object):
 
   def __init__(self):
     self._metrics = None
-    self._max_metrics = 30
+    self._max_metrics = 51
 
     # Loop-carried values alternate value and weight; all values are scalars.
-    self._initial_values = (
-        2 * self._max_metrics) * [tf.constant(0, tf.float32)]
+    self._initial_values = (2 *
+                            self._max_metrics) * [tf.constant(0, tf.float32)]
 
   def SetMetrics(self, metric_dict, step_args):
     """Sets the metrics to evaluate and the per-step output tensors.
@@ -190,8 +197,8 @@ class TpuEvalMetrics(object):
       loop).
     """
     num_metrics = len(metric_dict)
-    assert num_metrics <= self._max_metrics, (
-        'Feel free to increase _max_metrics.')
+    assert num_metrics <= self._max_metrics, ('Increase _max_metrics to >= %d' %
+                                              num_metrics)
     self._metrics = py_utils.NestedMap(metric_dict)
 
     # self._metrics contains a map of (metric_value,
@@ -238,7 +245,7 @@ class TpuEvalMetrics(object):
     # Each metric has two tensors in the loop carrying result.
     metrics = loop_result[:2 * len(self._metrics.Flatten())]
     # Aggregate across tpu replicas.
-    metrics = [tf.contrib.tpu.cross_replica_sum(x) for x in metrics]
+    metrics = [tf.compat.v1.tpu.cross_replica_sum(x) for x in metrics]
     ret = []
     for (value, weight) in self._Zip(metrics):
       value, weight = py_utils.WeightedAvg(value / weight, weight)
@@ -248,3 +255,83 @@ class TpuEvalMetrics(object):
   def PackMetricsValues(self, values):
     """Packs numpy values into a NestedMap of metrics."""
     return self.metrics.Pack(self._Zip(values))
+
+
+class AUCMetric(BaseMetric):
+  """Class to compute the AUC score for binary classification."""
+
+  def __init__(self, mode='roc', samples=-1):
+    """Constructor of the class.
+
+    Args:
+      mode: Possible values: 'roc' or 'pr'.
+      samples: The number of sample points to compute the AUC. If -1, include
+        all points seen thus far.
+
+    Raises:
+      ImportError: If user has installed sklearn, raise an ImportError.
+    """
+    if not HAS_SKLEARN:
+      raise ImportError('AUCMetric depends on sklearn.')
+    self._mode = mode
+    self._samples = samples
+    self._label = []
+    self._prob = []
+    self._weight = []
+    if self._mode == 'roc':
+      self._curve_fn = sklearn.metrics.roc_curve
+      self._score_fn = sklearn.metrics.roc_auc_score
+      self._plot_labels = ['False Positive Rate', 'True Positive Rate']
+    elif self._mode == 'pr':
+      self._curve_fn = sklearn.metrics.precision_recall_curve
+      self._score_fn = sklearn.metrics.average_precision_score
+      self._plot_labels = ['Recall', 'Precision']
+    else:
+      raise ValueError('mode in AUCMetric must be one of "roc" or "pr".')
+
+  def Update(self, label, prob, weight=None):
+    """Updates the metrics.
+
+    Args:
+      label: An array to specify the groundtruth binary labels. Values must be
+        either 0 or 1.
+      prob: An array to specify the prediction probabilities. Values must be
+        within [0, 1.0].
+      weight: An array to specify the sample weight for the auc computation.
+    """
+    self._label += label
+    self._prob += prob
+    if weight:
+      self._weight += weight
+    else:
+      self._weight += [1 for _ in range(len(label))]
+
+    if self._samples > 0:
+      self._label = self._label[-self._samples:]
+      self._prob = self._prob[-self._samples:]
+      self._weight = self._weight[-self._samples:]
+
+  @property
+  def value(self):
+    return self._score_fn(self._label, self._prob, sample_weight=self._weight)
+
+  def Summary(self, name):
+
+    def _Setter(fig, axes):
+      # 20 ticks betweein 0 and 1.
+      ticks = np.arange(0, 1.05, 0.05)
+      axes.grid(b=True)
+      axes.set_xlabel(self._plot_labels[0])
+      axes.set_xticks(ticks)
+      axes.set_ylabel(self._plot_labels[1])
+      axes.set_yticks(ticks)
+      fig.tight_layout()
+
+    xs, ys, _ = self._curve_fn(
+        self._label, self._prob, sample_weight=self._weight)
+    if self._mode == 'pr':
+      # Swap because sklearn returns <'precision', 'recall'>.
+      xs, ys = ys, xs
+    ret = plot.Curve(name=name, figsize=(12, 12), xs=xs, ys=ys, setter=_Setter)
+    ret.value.add(tag=name, simple_value=self.value)
+    return ret

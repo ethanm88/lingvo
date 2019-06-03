@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for wpm_encoder."""
+"""Tests for audio_lib."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -22,8 +22,8 @@ from __future__ import print_function
 import os
 
 import tensorflow as tf
-
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tools import audio_lib
 
 # The testdata contains: (soxi .../gan_or_vae.wav)
@@ -33,7 +33,7 @@ from lingvo.tools import audio_lib
 # Duration       : 00:00:03.16 = 75900 samples ~ 237.188 CDDA sectors
 
 
-class AudioLibTest(tf.test.TestCase):
+class AudioLibTest(test_utils.TestCase):
 
   def testDecodeFlacToWav(self):
     with open(
@@ -76,6 +76,20 @@ class AudioLibTest(tf.test.TestCase):
       audio_sample_rate, mfcc = sess.run([sample_rate, mfcc])
       assert audio_sample_rate == static_sample_rate
       self.assertAllEqual(mfcc.shape, [1, 126, 40])
+
+  def testExtractLogMelFeatures(self):
+    with open(
+        test_helper.test_src_dir_path('tools/testdata/gan_or_vae.16k.wav'),
+        'r') as f:
+      wav = f.read()
+
+    wav_bytes_t = tf.constant(wav, dtype=tf.string)
+    log_mel_t = audio_lib.ExtractLogMelFeatures(wav_bytes_t)
+
+    with self.session() as sess:
+      log_mel = sess.run(log_mel_t)
+      # Expect 314, 80 dimensional channels.
+      self.assertAllEqual(log_mel.shape, [1, 314, 80, 1])
 
 
 if __name__ == '__main__':

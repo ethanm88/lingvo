@@ -52,8 +52,13 @@ class _Cluster(object):
              'TensorFlow job spec, e.g., /job:trainer, /job:ps')
     p.Define('replicas', replicas, 'The number of tasks of a job.')
     p.Define(
-        'gpus_per_replica', 0, 'The number of GPU devices to use per '
-        'replica. If 0, we assume each replica has 1 CPU device.')
+        'targets', '', 'The target network address(es) to which we can '
+        'create tf sessions. E.g., a single ip:port, or a list of '
+        'comma-separated grpc://ip:port, etc.')
+    p.Define('cpus_per_replica', 1, 'The number of CPU devices to use per '
+             'replica.')
+    p.Define('gpus_per_replica', 0, 'The number of GPU devices to use per '
+             'replica.')
     p.Define(
         'devices_per_split', 1, 'Devices of a replica are grouped into '
         'splits. Each split contains these many devices. One split is a '
@@ -68,8 +73,7 @@ class _Cluster(object):
   @classmethod
   def Params(cls):
     """Defaults parameters for a cluster."""
-    p = hyperparams.Params()
-    p.Define('cls', cls, 'The class that this param is associated with.')
+    p = hyperparams.InstantiableParams(cls)
     p.Define(
         'mode', 'async', 'A string noting the overall training method. '
         'Valid values: sync, async.')
@@ -127,9 +131,11 @@ class _Cluster(object):
       devices.
     """
     if not job_spec.gpus_per_replica:
-      ret = np.empty((job_spec.replicas, 1), np.object)
+      cpus = job_spec.cpus_per_replica
+      ret = np.empty((job_spec.replicas, cpus), np.object)
       for i in range(job_spec.replicas):
-        ret[i, 0] = cls._MakeDeviceString(job_spec.name, i, 'CPU', 0)
+        for j in range(cpus):
+          ret[i, j] = cls._MakeDeviceString(job_spec.name, i, 'CPU', j)
     else:
       ret = np.empty((job_spec.replicas, job_spec.gpus_per_replica), np.object)
       for i in range(job_spec.replicas):
@@ -160,7 +166,6 @@ class _Cluster(object):
     # the same as p.ps.name, that means ps is colocated with worker.
     assert p.ps.replicas >= 0
     assert p.ps.gpus_per_replica >= 0
-    assert p.input.replicas <= 1
     if p.mode == 'async' and p.job == 'controller':
       # There is only 1 controller.
       assert p.controller.replicas == 1
@@ -223,12 +228,12 @@ class _Cluster(object):
     return self._job_spec
 
   @property
-  def async(self):
+  def asynchronous(self):
     """Returns True if configured for asynchronous training."""
     return self.params.mode == 'async'
 
   @property
-  def sync(self):
+  def synchronous(self):
     """Returns True if configured for synchronous training."""
     return self.params.mode == 'sync'
 
@@ -246,11 +251,18 @@ class _Cluster(object):
 
   @property
   def num_devices_per_replica(self):
-    num = self._job_spec.gpus_per_replica or self._job_spec.tpus_per_replica
-    if num == 0:
-      return 1  # cpu:0 only.
-    else:
-      return num
+    return (self._job_spec.gpus_per_replica or
+            self._job_spec.tpus_per_replica or self._job_spec.cpus_per_replica)
+
+  @property
+  def total_worker_devices(self):
+    """Return the total number of discrete worker devices in the cluster."""
+    worker_spec = self.params.worker
+    devices_per_replica = (
+        worker_spec.gpus_per_replica or worker_spec.tpus_per_replica or
+        self._job_spec.cpus_per_replica)
+    num_replicas = worker_spec.replicas
+    return devices_per_replica * num_replicas
 
   @property
   def num_devices_per_split(self):
@@ -266,7 +278,7 @@ class _Cluster(object):
   @property
   def num_splits_per_client(self):
     """The number of splits visible by one trainer client."""
-    if self.sync and self.job == 'trainer_client':
+    if self.synchronous and self.job == 'trainer_client':
       # One client drives all the workers.
       return self.num_splits_per_replica * self.num_replicas
     else:
@@ -284,14 +296,14 @@ class _Cluster(object):
     if self._job_spec.tpus_per_replica:
       ret = np.empty((1, self.num_devices_per_split), np.object)
       for i in range(self.num_devices_per_split):
-        ret[0, i] = tf.contrib.tpu.core(i)
+        ret[0, i] = tf.compat.v1.tpu.core(i)
       return ret
 
-    if self.job == 'trainer' and self.async:
+    if self.job == 'trainer' and self.asynchronous:
       # In async mode, each trainer task can only use its own devices.
       return self.ListDevices(self._job_spec)[self.task:(self.task + 1), :]
 
-    if self.job == 'trainer_client' and self.sync:
+    if self.job == 'trainer_client' and self.synchronous:
       # In sync mode, trainer_client can use every device.
       return self.ListDevices(self._job_spec)
 
@@ -306,12 +318,49 @@ class _Cluster(object):
   def input_device(self):
     """Returns the tensorflow device name to place input op on."""
     p = self.params
-    if self.sync and self.job == 'trainer_client' and p.input.replicas > 0:
+    if self.synchronous and p.input.replicas > 0:
       # Uses a separate job for input processing.
       assert p.input.replicas == 1
       return self.ListDevices(p.input)[0, 0]
     else:
       return ''
+
+  def PlaceInput(self, input_params):
+    """Applies a placement policy on the given input generator params.
+
+    By default, the policy is to place the input generator onto the input
+    device. Subclass can override PlaceInput method to implement more advanced
+    placement policy.
+
+    Args:
+      input_params: An input generator params.
+
+    Returns:
+      An input params which places the input generator on the input device.
+    """
+
+    class _UseInputDevice(input_params.cls):
+      """Places the input generator on the input device."""
+
+      def __init__(self, params):
+        with tf.device(self.cluster.input_device):
+          super(_UseInputDevice, self).__init__(params)
+
+      def SplitInputBatch(self, num_splits):
+        with tf.device(self.cluster.input_device):
+          return super(_UseInputDevice, self).SplitInputBatch(num_splits)
+
+    return input_params.Copy().Set(cls=_UseInputDevice)
+
+  @property
+  def input_targets(self):
+    """Returns a list of network addresses of the input job."""
+    p = self.params.input
+    if not p.targets:
+      return []
+    targets = p.targets.split(',')
+    assert p.replicas == len(targets), '{} vs. {}'.format(p.replicas, targets)
+    return targets
 
   def WorkerDeviceInModelSplit(self, device_index):
     """Returns the device to use for 'device_index' for the current model split.
@@ -420,7 +469,7 @@ class _LeastLoadedPlacer(VarPlacer):
     self._var_space_pq = [(0, d) for d in var_devices]
 
   def _AssignVar(self, var_op):
-    size = tf.DType(var_op.get_attr('dtype')).size
+    size = var_op.get_attr('dtype').size
     shape = tf.TensorShape(var_op.get_attr('shape'))
     assert self._var_space_pq, ('No ps devices to use.')
     allocated, device = heapq.heappop(self._var_space_pq)

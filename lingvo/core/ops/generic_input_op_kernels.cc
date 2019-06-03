@@ -102,6 +102,18 @@ class GenericInputProcessor : public RecordProcessor {
     // processing each individual record using multiple threads
     // (tf_compute).
     FunctionLibraryRuntime::Options opts;
+    // Create a step container that uses resource manager to cleanup state
+    // after the step is complete.
+    ScopedStepContainer step_container(
+        step_id_counter_.fetch_add(1),
+        [this](const string& name) {
+          auto status = flib_->device()->resource_manager()->Cleanup(name);
+          if (!status.ok()) {
+            LOG(ERROR) << "Error cleaning up resources:" << status;
+          }
+        },
+        "GenericInputProcessor");
+    opts.step_container = &step_container;
     opts.runner = ThreadLocalRunner::PerThread().runner();
 
     // The input is a single scalar string tensor.
@@ -134,7 +146,7 @@ class GenericInputProcessor : public RecordProcessor {
     return Status::OK();
   }
 
-  Status Merge(int64 bucket_id, const std::vector<TensorVec>& samples,
+  Status Merge(int64 bucket_size, const std::vector<TensorVec>& samples,
                TensorVec* batch) override {
     CHECK(!samples.empty());
     const auto num_samples = samples.size();
@@ -147,6 +159,9 @@ class GenericInputProcessor : public RecordProcessor {
 
       for (int j = 0; j < num_outs; ++j) {
         const int pad_dim = dynamic_padding_dimensions_[j];
+        if (pad_dim == -1) {
+          continue;
+        }
         const int pad_value = dynamic_padding_constants_[j];
 
         int64 max_length = 0;
@@ -171,7 +186,7 @@ class GenericInputProcessor : public RecordProcessor {
       typedef Eigen::DSizes<Eigen::DenseIndex, 2> DSizes;        \
       dst_t.slice(DSizes(), DSizes(src_t.dimensions())) = src_t; \
     }                                                            \
-    break;
+    break
 
               CASE(float);
               CASE(int32);
@@ -238,7 +253,7 @@ class GenericInputProcessor : public RecordProcessor {
 #define CASE(T)                                                               \
   case DataTypeToEnum<T>::value:                                              \
     merged->flat_outer_dims<T>().chip<0>(j) = padded_samples[j][i].flat<T>(); \
-    break;
+    break
                         CASE(float);
                         CASE(int32);
                         CASE(int64);
@@ -261,6 +276,8 @@ class GenericInputProcessor : public RecordProcessor {
   std::unique_ptr<ProcessFunctionLibraryRuntime> pflr_;
   FunctionLibraryRuntime* flib_ = nullptr;  // Not owned.
   FunctionLibraryRuntime::Handle handle_;
+  std::atomic_int_fast64_t step_id_counter_;
+
   int num_merger_threads_ = -1;
   thread::ThreadPool* merger_ = nullptr;
   Runner merger_runner_;

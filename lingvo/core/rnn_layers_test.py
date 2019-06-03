@@ -18,6 +18,7 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import types
 import unittest
 
 import numpy as np
@@ -60,14 +61,16 @@ def AddTimestepAccumulator(layer):
   layer.RegisterAccumulator('ts_count', TimestepAccumulator())
 
 
-class LayersTestBase(tf.test.TestCase):
+class LayersTestBase(test_utils.TestCase):
 
   def _testStackedFRNNHelper(self,
                              cls,
                              dtype,
                              trailing_pad_len=0,
                              keep_prob=1.0,
-                             bi_directional=False):
+                             bi_directional=False,
+                             input_dim=-1,
+                             output_dim=-1):
     tf.set_random_seed(123456)
     batch = 3
     dims = 16
@@ -95,11 +98,16 @@ class LayersTestBase(tf.test.TestCase):
         sfrnn_params.num_layers = num_layers
         sfrnn_params.skip_start = 2
         sfrnn_params.dropout.keep_prob = keep_prob
+        sfrnn_params.num_input_nodes = input_dim
+        sfrnn_params.num_output_nodes = output_dim
         with tf.name_scope('sfrnn'):
-          sfrnn = sfrnn_params.cls(sfrnn_params)
+          sfrnn = sfrnn_params.Instantiate()
 
         np.random.seed(12345)
-        inputs = tf.constant(np.random.uniform(size=(slen, batch, dims)), dtype)
+        input_dim = input_dim if input_dim > 0 else dims
+        output_dim = output_dim if output_dim > 0 else dims
+        inputs = tf.constant(
+            np.random.uniform(size=(slen, batch, input_dim)), dtype)
         paddings = np.zeros([slen, batch, 1])
         if trailing_pad_len > 0:
           paddings[-trailing_pad_len:, :] = 1.0
@@ -109,9 +117,13 @@ class LayersTestBase(tf.test.TestCase):
         tf.global_variables_initializer().run()
         if bi_directional:
           sfrnn_outputs = sfrnn.FPropFullSequence(sfrnn.theta, inputs, paddings)
+          sfrnn_outputs = py_utils.HasShape(sfrnn_outputs,
+                                            [slen, batch, output_dim])
           return sess.run(sfrnn_outputs)
         else:
           sfrnn_outputs, sfrnn_final = sfrnn.FPropDefaultTheta(inputs, paddings)
+          sfrnn_outputs = py_utils.HasShape(sfrnn_outputs,
+                                            [slen, batch, output_dim])
           return sess.run([sfrnn_outputs, sfrnn_final])
 
   def _testStackedFRNNGradHelper(self, cls, bi_directional=False):
@@ -141,7 +153,7 @@ class LayersTestBase(tf.test.TestCase):
       sfrnn_params.num_layers = num_layers
       sfrnn_params.skip_start = 2
       with tf.name_scope('sfrnn'):
-        sfrnn = sfrnn_params.cls(sfrnn_params)
+        sfrnn = sfrnn_params.Instantiate()
 
       np.random.seed(12345)
       inputs = tf.constant(np.random.uniform(size=(slen, batch, dims)), dtype)
@@ -158,7 +170,7 @@ class LayersTestBase(tf.test.TestCase):
         loss = tf.reduce_sum(sfrnn_outputs)
         for fin in sfrnn_final.rnn:
           loss += tf.reduce_sum(fin.m) + tf.reduce_sum(fin.c)
-      xs = sfrnn.theta.Flatten() + [inputs]
+      xs = sfrnn.vars.Flatten() + [inputs]
       dxs = tf.gradients(loss, xs)
 
       # Compares the sym grad against the numeric grads.
@@ -185,7 +197,7 @@ class LayersTest(LayersTestBase):
     with self.session(use_gpu=False) as sess:
       rnn_params = rnn_layers.IdentitySeqLayer.Params()
       rnn_params.name = 'no_op'
-      rnn = rnn_params.cls(rnn_params)
+      rnn = rnn_params.Instantiate()
 
       np.random.seed(12345)
       inputs_sequence = []
@@ -615,7 +627,7 @@ class LayersTest(LayersTestBase):
       frnn_params.vn = rnn_params.vn
 
       with tf.variable_scope('frnn'):
-        frnn = frnn_params.cls(frnn_params)
+        frnn = frnn_params.Instantiate()
 
       frnn_outputs, frnn_final = frnn.FPropDefaultTheta(
           tf.stack(inputs_sequence), tf.stack(paddings_sequence))
@@ -673,7 +685,7 @@ class LayersTest(LayersTestBase):
                             [rnn_params.sequence_length, -1, 1, 1, 1])
       loss = tf.reduce_sum(tf.reduce_sum(
           outputs, axis=0)) + tf.reduce_sum(final.m + final.c)
-      all_vars = tf.all_variables()
+      all_vars = tf.trainable_variables()
       assert len(all_vars) == 2
 
       grads = tf.gradients(loss, all_vars)
@@ -716,7 +728,7 @@ class LayersTest(LayersTestBase):
       outputs, final = frnn.FPropDefaultTheta(inputs_sequence, paddings)
       outputs *= tf.reshape(paddings, [10, 3, 1, 1, 1])
       loss = tf.reduce_sum(outputs) + tf.reduce_sum(final.m + final.c)
-      all_vars = tf.all_variables()
+      all_vars = tf.trainable_variables()
       assert len(all_vars) == 2
 
       grads = tf.gradients(loss, all_vars)
@@ -908,6 +920,20 @@ class LayersTest(LayersTestBase):
       rtol = 1e-6
     self.assertAllClose([175.974121], [np.sum(v1_out * v1_out)], rtol=rtol)
 
+  def testStackedFRNNInputOutputDims(self):
+    v1_out, _ = self._testStackedFRNNHelper(
+        rnn_layers.StackedFRNNLayerByLayer,
+        tf.float32,
+        trailing_pad_len=0,
+        keep_prob=0.5,
+        input_dim=5,
+        output_dim=7)
+    if tf.test.is_gpu_available():
+      rtol = 1e-5
+    else:
+      rtol = 1e-6
+    self.assertAllClose([32.743263], [np.sum(v1_out * v1_out)], rtol=rtol)
+
   def testStackedFRNNLayerByLayerGrad(self):
     self._testStackedFRNNGradHelper(rnn_layers.StackedFRNNLayerByLayer)
 
@@ -923,6 +949,21 @@ class LayersTest(LayersTestBase):
     else:
       rtol = 1e-6
     self.assertAllClose([305.774384], [np.sum(v1_out * v1_out)], rtol=rtol)
+
+  def testStackedBiFRNNInputOutputDims(self):
+    v1_out = self._testStackedFRNNHelper(
+        rnn_layers.StackedBiFRNNLayerByLayer,
+        tf.float32,
+        trailing_pad_len=0,
+        keep_prob=0.5,
+        bi_directional=True,
+        input_dim=5,
+        output_dim=8)
+    if tf.test.is_gpu_available():
+      rtol = 1e-5
+    else:
+      rtol = 1e-6
+    self.assertAllClose([8.116007], [np.sum(v1_out * v1_out)], rtol=rtol)
 
   def testStackedBiFRNNLayerByLayerGrad(self):
     self._testStackedFRNNGradHelper(
@@ -1148,7 +1189,7 @@ class LayersTest(LayersTestBase):
       de_atten.source_dim = alt_depth
       p.source_name_to_attention_params = {'de': de_atten}
       merger_tpl.pre_proj_input_dims = [dims, dims, alt_depth]
-      merger_tpl.pre_proj_output_dim = dims
+      merger_tpl.pre_proj_output_dims = [dims, dims, dims]
       merger_tpl.proj_tpl.batch_norm = False
       merger_tpl.proj_tpl.weight_norm = True
 
@@ -1157,7 +1198,7 @@ class LayersTest(LayersTestBase):
   def testMultiSourceFRNNWithAttention(self):
     with self.session(use_gpu=True) as sess:
       p = self._MultiSourceFRNNWithAttentionParams()
-      msrc_frnn = p.cls(p)
+      msrc_frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs,
        paddings) = self._MultiSourceFRNNWithAttentionInputs()
@@ -1194,7 +1235,7 @@ class LayersTest(LayersTestBase):
   def testMultiSourceFRNNWithAttentionMultiDepth(self):
     with self.session(use_gpu=True) as sess:
       p = self._MultiSourceFRNNWithAttentionParams(single_source_length=False)
-      msrc_frnn = p.cls(p)
+      msrc_frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs, paddings
       ) = self._MultiSourceFRNNWithAttentionInputs(single_source_length=False)
@@ -1232,7 +1273,7 @@ class LayersTest(LayersTestBase):
         use_gpu=True, config=py_utils.SessionConfig(inline=False)) as sess:
       p = self._MultiSourceFRNNWithAttentionParams(
           single_source=True, dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs,
        paddings) = self._MultiSourceFRNNWithAttentionInputs(
@@ -1272,7 +1313,7 @@ class LayersTest(LayersTestBase):
 
       p = self._MultiSourceFRNNWithAttentionParams(
           single_source=True, dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs,
        paddings) = self._MultiSourceFRNNWithAttentionInputs(
@@ -1319,7 +1360,7 @@ class LayersTest(LayersTestBase):
         use_gpu=True, config=py_utils.SessionConfig(inline=False)) as sess:
 
       p = self._MultiSourceFRNNWithAttentionParams(dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       # Fetch all the parameters.
       w0, b0 = (frnn.theta.cell.wm, frnn.theta.cell.b)
@@ -1378,7 +1419,7 @@ class LayersTest(LayersTestBase):
 
       p = self._MultiSourceFRNNWithAttentionParams(
           single_source_length=False, dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       # Fetch all the parameters.
       w0, b0 = (frnn.theta.cell.wm, frnn.theta.cell.b)
@@ -1488,7 +1529,7 @@ class LayersTest(LayersTestBase):
           tlen=tlen,
           tbatch=tbatch)
 
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       src_encs = tf.constant(
           np.random.uniform(size=[slen, sbatch, dims]), dtype)
@@ -1540,7 +1581,7 @@ class LayersTest(LayersTestBase):
           tlen=tlen,
           tbatch=tbatch)
 
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       src_encs = tf.constant(
           np.random.uniform(size=[slen, sbatch, dims]), dtype)
@@ -1570,6 +1611,69 @@ class LayersTest(LayersTestBase):
       self.assertAllClose(
           np.zeros(shape=(tlen, tbatch, dims // 2)),
           atten_ctx_v[:, :, 0:dims:2])
+
+  def _testFRNNWithAttentionUseZeroAttenState(self, zero_atten_state_fn):
+    dtype = tf.float32
+    dims = 5
+    slen = 4
+    tlen = 3
+    sbatch = 2
+    tbatch = 6
+
+    with self.session(use_gpu=True) as sess:
+      p = self._CreateFRNNWithAttentionParams(
+          dtype=dtype,
+          dims=dims,
+          slen=slen,
+          sbatch=sbatch,
+          tlen=tlen,
+          tbatch=tbatch)
+      p.use_zero_atten_state = True
+      p.atten_context_dim = dims
+      frnn = p.Instantiate()
+
+      # Override the ZeroAttentionState to have the desired output type
+      frnn.atten.ZeroAttentionState = types.MethodType(zero_atten_state_fn,
+                                                       frnn.atten)
+
+      src_encs = tf.constant(
+          np.random.uniform(size=[slen, sbatch, dims]), dtype)
+      src_paddings = tf.constant(np.zeros([slen, sbatch]), dtype)
+
+      inputs = tf.constant(np.random.uniform(size=(tlen, tbatch, dims)), dtype)
+      paddings = tf.constant(np.zeros([tlen, tbatch, 1]), dtype)
+
+      atten_ctx, rnn_out, atten_prob, _ = frnn.FPropDefaultTheta(
+          src_encs, src_paddings, inputs, paddings)
+
+      tf.global_variables_initializer().run()
+      atten_ctx, rnn_out, atten_prob = sess.run(
+          [atten_ctx, rnn_out, atten_prob])
+
+      # Check shapes
+      self.assertEqual(atten_ctx.shape, (tlen, tbatch, dims))
+      self.assertEqual(rnn_out.shape, (tlen, tbatch, dims))
+      self.assertEqual(atten_prob.shape, (tlen, tbatch, slen))
+
+  def testFRNNWithAttentionUseZeroAttenStateTensor(self):
+
+    def _TensorZeroAttenState(self, source_seq_length, decoder_batch_size):
+      del source_seq_length
+      p = self.params
+      zs = tf.zeros([decoder_batch_size, 1], dtype=py_utils.FPropDtype(p))
+      return zs
+
+    self._testFRNNWithAttentionUseZeroAttenState(_TensorZeroAttenState)
+
+  def testFRNNWithAttentionUseZeroAttenStateNestedMap(self):
+
+    def _NestedMapZeroAttenState(self, source_seq_length, decoder_batch_size):
+      del source_seq_length
+      p = self.params
+      zs = tf.zeros([decoder_batch_size, 1], dtype=py_utils.FPropDtype(p))
+      return py_utils.NestedMap(z=zs)
+
+    self._testFRNNWithAttentionUseZeroAttenState(_NestedMapZeroAttenState)
 
 
 if __name__ == '__main__':

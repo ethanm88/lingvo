@@ -50,14 +50,14 @@ class BaseEncoder(base_layer.BaseLayer):
         ['good', 'day', 'thanks'] -> ['guten-tag', 'danke'], the source segment
         ids would be [0, 0, 1] and target segment ids would be [0, 1]. These ids
         are meant to enable masking computations for different examples from
-        each other. Models or layers than don't support packed inputs should
+        each other. Models or layers that don't support packed inputs should
         pass None.
 
     Returns:
-      (outputs, out_paddings, src_segment_ids) triple.
-      `outputs` is of the shape [time, batch, depth], and `out_paddings` is of
-      the shape [time, batch, 1]. src_segment_ids should have the shape
-      [time, batch] if packed inputs are supported by the model (and all
-      layers), or None otherwise.
+      A NestedMap, usually containing:
+        * `encoded` - feature tensor of the shape [time, batch, depth]
+        * `padding` - 0/1 tensor of the shape [time, batch, 1].
+        * `segment_id` - (optional) present and have the shape [time, batch]
+          if packed inputs are supported by the model (and all layers).
     """
     raise NotImplementedError('Abstract method')

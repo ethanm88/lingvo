@@ -19,7 +19,6 @@ from __future__ import print_function
 
 import collections
 
-import six
 from six.moves import range
 from six.moves import zip
 
@@ -27,12 +26,14 @@ import tensorflow as tf
 
 from lingvo.core import base_layer
 from lingvo.core import base_model
-from lingvo.core import lr_schedule
 from lingvo.core import metrics
 from lingvo.core import py_utils
+from lingvo.core import schedule
 from lingvo.tasks.asr import decoder
 from lingvo.tasks.asr import decoder_utils
 from lingvo.tasks.asr import encoder
+from lingvo.tasks.asr import frontend as asr_frontend
+from lingvo.tools import audio_lib
 
 # hyps: [num_beams, num_hyps_per_beam] of serialized Hypothesis protos.
 # ids: [num_beams * num_hyps_per_beam, max_target_length].
@@ -52,12 +53,13 @@ class AsrModel(base_model.BaseTask):
     p.encoder = encoder.AsrEncoder.Params()
     p.decoder = decoder.AsrDecoder.Params()
     p.Define(
-        'target_key', '', 'If non-empty, will use the specified key from '
-        'input_batch.additional_tgts to set training targets.')
+        'frontend', None,
+        'ASR frontend to extract features from input. Defaults to no frontend '
+        'which means that features are taken directly from the input.')
 
     tp = p.train
     tp.lr_schedule = (
-        lr_schedule.PiecewiseConstantLearningRateSchedule.Params().Set(
+        schedule.PiecewiseConstantLearningRateSchedule.Params().Set(
             boundaries=[350000, 500000, 600000], values=[1.0, 0.1, 0.01,
                                                          0.001]))
     tp.vn_start_step = 20000
@@ -87,25 +89,77 @@ class AsrModel(base_model.BaseTask):
         if not p.decoder.name:
           p.decoder.name = 'dec'
         self.CreateChild('decoder', p.decoder)
+      if p.frontend:
+        self.CreateChild('frontend', p.frontend)
+
+  def _GetDecoderTargets(self, input_batch):
+    """Returns targets which will be forwarded to the decoder.
+
+     Subclasses can override this method to change the target that is used by
+     the decoder. For example, a subclass could add additional targets that
+     can be forwared to the decoder.
+
+    Args:
+      input_batch: a NestedMap which contains the targets.
+
+    Returns:
+      a NestedMap corresponding to the target selected.
+    """
+    return input_batch.tgt
+
+  def _MakeDecoderTheta(self, theta, input_batch):
+    """Compute theta to be used by the decoder for computing metrics and loss.
+
+    This method can be over-ridden by child classes to add values to theta that
+    is passed to the decoder.
+
+    For example, to pass the one hot vector which indicates which data source
+    was selected a child class could over-ride this method as follows:
+
+    def _MakeDecoderTheta(self, theta):
+      decoder_theta = super(MyModel, self)._MakeDecoderTheta(theta, input_batch)
+      decoder_theta.child_onehot = input_batch.source_selected
+      return decoder_theta
+
+    Args:
+      theta: A `.NestedMap` object containing variable values used to compute
+        loss and metrics.
+      input_batch: NestedMap containing input data in the current batch. Unused
+      here.
+
+    Returns:
+      theta: A copy of the decoder theta.
+    """
+    del input_batch  # Unused
+    return theta.decoder.DeepCopy()
 
   def ComputePredictions(self, theta, input_batch):
-    src_enc, src_enc_padding, src_seg_id = self.encoder.FProp(
-        theta.encoder, input_batch.src)
-    if self.params.target_key:
-      tf.logging.info(
-          'Using batch.additional_tgts[%s] to source '
-          'tgts instead of batch.tgts.', self.params.target_key)
-      tgt = input_batch.additional_tgts[self.params.target_key]
-    else:
-      tgt = input_batch.tgt
-    return self.decoder.ComputePredictions(theta.decoder, src_enc,
-                                           src_enc_padding, tgt, src_seg_id)
+    input_batch_src = input_batch.src
+    encoder_outputs = self._FrontendAndEncoderFProp(theta, input_batch_src)
+    tgt = self._GetDecoderTargets(input_batch)
+    decoder_theta = self._MakeDecoderTheta(theta, input_batch)
+    return self.decoder.ComputePredictions(decoder_theta, encoder_outputs, tgt)
 
   def ComputeLoss(self, theta, input_batch, predictions):
-    tgt = input_batch.tgt
-    if self.params.target_key:
-      tgt = input_batch.additional_tgts[self.params.target_key]
-    return self.decoder.ComputeLoss(theta.decoder, predictions, tgt)
+    tgt = self._GetDecoderTargets(input_batch)
+    decoder_theta = self._MakeDecoderTheta(theta, input_batch)
+    return self.decoder.ComputeLoss(decoder_theta, predictions, tgt)
+
+  def _FrontendAndEncoderFProp(self, theta, input_batch_src):
+    """FProps through the frontend and encoder.
+
+    Args:
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
+      input_batch_src: An input NestedMap as per `BaseAsrFrontend.FProp`.
+
+    Returns:
+      A NestedMap as from `AsrEncoder.FProp`.
+    """
+    p = self.params
+    if p.frontend:
+      input_batch_src = self.frontend.FProp(theta.frontend, input_batch_src)
+    return self.encoder.FProp(theta.encoder, input_batch_src)
 
   def _GetTopK(self, decoder_outs, tag=''):
     hyps = decoder_outs.topk_hyps
@@ -116,9 +170,11 @@ class AsrModel(base_model.BaseTask):
 
     if ids is not None:
       decoded = self.input_generator.IdsToStrings(ids, lens - 1)
-      decoded = tf.identity(decoded, name='top_k_decoded')
+      decoded = tf.identity(decoded, name='top_k_decoded%s' % tag)
       decoded = tf.reshape(decoded, tf.shape(hyps))
     if scores is not None and hyps is not None:
+      scores = tf.identity(
+          tf.reshape(scores, tf.shape(lens)), name='top_k_scores%s' % tag)
       scores = tf.reshape(scores, tf.shape(hyps))
     return DecoderTopK(hyps, ids, lens, scores, decoded)
 
@@ -136,7 +192,8 @@ class AsrModel(base_model.BaseTask):
     return norm_wer_errors, norm_wer_words
 
   def AddAdditionalDecoderMetricsToGraph(self, topk_hyps, filtered_hyps,
-                                         filtered_refs):
+                                         filtered_refs, input_batch,
+                                         decoder_outs):
     """Returns a dict of metrics which should be computed from decoded hyps."""
     # The base class implementation returns an empty dictionary. Sub-classes can
     # provide their own implementation.
@@ -146,54 +203,79 @@ class AsrModel(base_model.BaseTask):
     """Constructs the inference graph."""
     p = self.params
     with tf.name_scope('fprop'), tf.name_scope(p.name):
-      src_enc, src_enc_padding, _ = (
-          self.encoder.FPropDefaultTheta(input_batch.src))
+      encoder_outputs = self._FrontendAndEncoderFProp(self.theta,
+                                                      input_batch.src)
+      decoder_outs = self.decoder.BeamSearchDecode(encoder_outputs)
+      return self._ComputeDecoderMetrics(decoder_outs, input_batch)
 
-      if hasattr(self.decoder, 'contextualizer'):
-        self.decoder.contextualizer.SetContextMap(input_batch.tgt)
-      decoder_outs = self.decoder.BeamSearchDecode(src_enc, src_enc_padding)
-      topk = self._GetTopK(decoder_outs)
+  def _GetTargetForDecoderMetrics(self, input_batch):
+    """Returns targets which will be used to compute decoder metrics.
 
-      utt_ids = input_batch.sample_ids
-      tgt = input_batch.tgt
-      if p.target_key:
-        tgt = input_batch.additional_tgts[p.target_key]
-      transcripts = self.input_generator.IdsToStrings(
-          tgt.labels,
-          tf.cast(tf.reduce_sum(1.0 - tgt.paddings, 1) - 1.0, tf.int32))
+     Subclasses can override this method to change the target that is used when
+     calculating decoder metrics.
 
-      # Filter out all isolated '<noise>' tokens.
-      noise_pattern = ' <noise> |^<noise> | <noise>$|^<noise>$'
-      filtered_refs = tf.regex_replace(transcripts, noise_pattern, ' ')
-      filtered_hyps = tf.regex_replace(topk.decoded, noise_pattern, ' ')
-      # Compute translation quality scores for all hyps.
-      filtered_refs = tf.tile(
-          tf.reshape(filtered_refs, [-1, 1]),
-          [1, p.decoder.beam_search.num_hyps_per_beam])
-      filtered_hyps = tf.reshape(filtered_hyps, [-1])
-      filtered_refs = tf.reshape(filtered_refs, [-1])
-      norm_wer_errors, norm_wer_words = self._ComputeNormalizedWER(
-          filtered_hyps, filtered_refs)
+    Args:
+      input_batch: a NestedMap which contains the targets.
 
-      ret_dict = {
-          'target_ids': tgt.ids,
-          'target_labels': tgt.labels,
-          'target_weights': tgt.weights,
-          'target_paddings': tgt.paddings,
-          'utt_id': utt_ids,
-          'transcripts': transcripts,
-          'topk_decoded': topk.decoded,
-          'topk_ids': topk.ids,
-          'topk_lens': topk.lens,
-          'topk_scores': topk.scores,
-          'norm_wer_errors': norm_wer_errors,
-          'norm_wer_words': norm_wer_words,
-      }
+    Returns:
+      a NestedMap containing 'ids', 'labels', 'paddings', 'weights'
+    """
+    return self._GetDecoderTargets(input_batch)
 
-      ret_dict.update(
-          self.AddAdditionalDecoderMetricsToGraph(topk, filtered_hyps,
-                                                  filtered_refs))
-      return ret_dict
+  def _ComputeDecoderMetrics(self, decoder_outs, input_batch):
+    """Computes metrics on output from decoder.
+
+    Args:
+      decoder_outs: A `BeamSearchDecodeOutput`, a namedtuple containing the
+        decode results.
+      input_batch:  A `NestedMap` of tensors representing the source, target,
+        and other components of the input batch.
+
+    Returns:
+      A dict of Tensors containing decoder output and metrics.
+    """
+    p = self.params
+    topk = self._GetTopK(decoder_outs)
+
+    utt_ids = input_batch.sample_ids
+    tgt = self._GetTargetForDecoderMetrics(input_batch)
+    transcripts = self.input_generator.IdsToStrings(
+        tgt.labels,
+        tf.cast(tf.reduce_sum(1.0 - tgt.paddings, 1) - 1.0, tf.int32))
+
+    # Filter out all isolated '<noise>' tokens.
+    noise_pattern = ' <noise> |^<noise> | <noise>$|^<noise>$'
+    filtered_refs = tf.regex_replace(transcripts, noise_pattern, ' ')
+    filtered_hyps = tf.regex_replace(topk.decoded, noise_pattern, ' ')
+    # Compute translation quality scores for all hyps.
+    filtered_refs = tf.tile(
+        tf.reshape(filtered_refs, [-1, 1]),
+        [1, p.decoder.beam_search.num_hyps_per_beam])
+    filtered_hyps = tf.reshape(filtered_hyps, [-1])
+    filtered_refs = tf.reshape(filtered_refs, [-1])
+    norm_wer_errors, norm_wer_words = self._ComputeNormalizedWER(
+        filtered_hyps, filtered_refs)
+
+    ret_dict = {
+        'target_ids': tgt.ids,
+        'target_labels': tgt.labels,
+        'target_weights': tgt.weights,
+        'target_paddings': tgt.paddings,
+        'utt_id': utt_ids,
+        'transcripts': transcripts,
+        'topk_decoded': topk.decoded,
+        'topk_ids': topk.ids,
+        'topk_lens': topk.lens,
+        'topk_scores': topk.scores,
+        'norm_wer_errors': norm_wer_errors,
+        'norm_wer_words': norm_wer_words,
+    }
+
+    ret_dict.update(
+        self.AddAdditionalDecoderMetricsToGraph(topk, filtered_hyps,
+                                                filtered_refs, input_batch,
+                                                decoder_outs))
+    return ret_dict
 
   def CreateAdditionalDecoderMetrics(self):
     """Returns a dictionary of additional metrics which should be computed."""
@@ -322,3 +404,63 @@ class AsrModel(base_model.BaseTask):
     dec_metrics_dict = self.UpdateAdditionalMetrics(dec_out_dict,
                                                     dec_metrics_dict)
     return key_value_pairs
+
+  def Inference(self):
+    """Constructs inference subgraphs.
+
+    Returns:
+      A dictionary of the form {'subgraph_name': (fetches, feeds)}. Each of
+      fetches and feeds is itself a dictionary which maps a string name (which
+      describes the tensor) to a corresponding tensor in the inference graph
+      which should be fed/fetched from.
+    """
+    subgraphs = {}
+    with tf.name_scope('inference'):
+      subgraphs['default'] = self._InferenceSubgraph_Default()
+    return subgraphs
+
+  def _InferenceSubgraph_Default(self):
+    """Constructs graph for offline inference.
+
+    Returns:
+      (fetches, feeds) where both fetches and feeds are dictionaries. Each
+      dictionary consists of keys corresponding to tensor names, and values
+      corresponding to a tensor in the graph which should be input/read from.
+    """
+    p = self.params
+    with tf.name_scope('default'):
+      # TODO(laurenzo): Once the migration to integrated frontends is complete,
+      # this model should be upgraded to use the MelAsrFrontend in its
+      # params vs relying on pre-computed feature generation and the inference
+      # special casing.
+      wav_bytes = tf.placeholder(dtype=tf.string, name='wav')
+      frontend = self.frontend if p.frontend else None
+      if not frontend:
+        # No custom frontend. Instantiate the default.
+        frontend_p = asr_frontend.MelAsrFrontend.Params()
+        frontend = frontend_p.Instantiate()
+
+      # Decode the wave bytes and use the explicit frontend.
+      unused_sample_rate, audio = audio_lib.DecodeWav(wav_bytes)
+      audio *= 32768
+      # Remove channel dimension, since we have a single channel.
+      audio = tf.squeeze(audio, axis=1)
+      # Add batch.
+      audio = tf.expand_dims(audio, axis=0)
+      input_batch_src = py_utils.NestedMap(
+          src_inputs=audio, paddings=tf.zeros_like(audio))
+      input_batch_src = frontend.FPropDefaultTheta(input_batch_src)
+
+      encoder_outputs = self.encoder.FPropDefaultTheta(input_batch_src)
+      decoder_outputs = self.decoder.BeamSearchDecode(encoder_outputs)
+      topk = self._GetTopK(decoder_outputs)
+
+      feeds = {'wav': wav_bytes}
+      fetches = {
+          'hypotheses': topk.decoded,
+          'scores': topk.scores,
+          'src_frames': input_batch_src.src_inputs,
+          'encoder_frames': encoder_outputs.encoded
+      }
+
+      return fetches, feeds

@@ -5,11 +5,6 @@ package(
 
 licenses(["notice"])  # Apache 2.0
 
-load(
-    "//lingvo:lingvo.bzl",
-    "lingvo_cuda_py_test",
-)
-
 py_library(
     name = "input_generator",
     srcs = ["input_generator.py"],
@@ -17,9 +12,9 @@ py_library(
         # Implicit tensorflow dependency.
         "//lingvo/core:base_input_generator",
         "//lingvo/core:base_layer",
+        "//lingvo/core:generic_input",
         "//lingvo/core:py_utils",
         "//lingvo/core:tokenizers",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
@@ -28,12 +23,15 @@ py_test(
     srcs = ["input_generator_test.py"],
     data = [
         "//lingvo/tasks/lm/testdata:lm1b_100",
-        "//lingvo/tasks/punctuator/testdata:test_vocab",
+        "//lingvo/tasks/punctuator/params:brown_corpus_wpm_data",
     ],
+    python_version = "PY2",
     deps = [
         ":input_generator",
         # Implicit tensorflow dependency.
+        "//lingvo/core:py_utils",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -42,7 +40,6 @@ py_library(
     srcs = ["model.py"],
     deps = [
         # Implicit tensorflow dependency.
-        "//lingvo/core:metrics",
         "//lingvo/core:py_utils",
         "//lingvo/tasks/mt:model",
     ],
@@ -50,20 +47,20 @@ py_library(
 
 py_test(
     name = "model_test",
+    size = "large",
     srcs = ["model_test.py"],
     data = [
         "//lingvo/tasks/lm/testdata:lm1b_100",
-        "//lingvo/tasks/punctuator/testdata:test_vocab",
+        "//lingvo/tasks/punctuator/params:brown_corpus_wpm_data",
     ],
+    python_version = "PY2",
     shard_count = 4,
     deps = [
         ":input_generator",
         ":model",
         # Implicit numpy dependency.
         # Implicit tensorflow dependency.
-        "//lingvo/core:py_utils",
         "//lingvo/core:test_helper",
-        "//lingvo/tasks/mt:decoder",
-        "//lingvo/tasks/mt:encoder",
+        "//lingvo/core:test_utils",
     ],
 )

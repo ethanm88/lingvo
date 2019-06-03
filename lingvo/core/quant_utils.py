@@ -134,8 +134,6 @@ class QuantizableLayer(base_layer.BaseLayer):
     self._tracked_tensors = dict()  # tracked t_name -> (QDomain)
     self._qstate = None  # t_name -> Tensor
 
-    self._AddQuantizationFunctions()
-
     # Instantiate quantization domains.
     with tf.variable_scope(p.name + '/q'):
       self._qdomains = dict()  # Dict of qdname -> QDomain or None
@@ -148,6 +146,8 @@ class QuantizableLayer(base_layer.BaseLayer):
         qdchild_name = 'qdomain_' + qdname
         self.CreateChild(qdchild_name, qdparams)
         self._qdomains[qdname] = self.children[qdchild_name]
+    self._AddQuantizationFunctions()
+
 
   def QRTanh(self, t, domain='actf'):
     """Quantizes the output of a tanh (-1.0, 1.0)."""
@@ -159,18 +159,22 @@ class QuantizableLayer(base_layer.BaseLayer):
     qd = self.GetQDomain(domain)
     return qd.QuantizeNaturalRange(t, 0.0, 1.0) if qd else t
 
-  def QRSoftmax(self, t, domain='softmax'):
-    """Quantizes the output of a softmax (0, 1.0)."""
+  def QRSoftmax(self, t, domain='softmax', narrow_to_asym_bit_depth=False):
+    """Quantizes the output of a softmax (0, 1.0 - 1.0/2^-bits)."""
     qd = self.GetQDomain(domain)
-    return qd.QuantizeNaturalRange(t, 0.0, 1.0) if qd else t
+    # Override based on TFLite softmax support.
+    softmax_max = 1.0
+    if qd is not None and narrow_to_asym_bit_depth:
+      softmax_max = (2**qd.bits - 1) / (2**qd.bits)
+    return qd.QuantizeNaturalRange(t, 0.0, softmax_max) if qd else t
 
   def QRRelu(self, t, domain='relu'):
-    """Quantizes the output of a softmax (0, 1.0)."""
+    """Quantizes the output of a relu (0, 1.0)."""
     qd = self.GetQDomain(domain)
     return qd.QuantizeNaturalRange(t, 0.0, 1.0) if qd else t
 
   def QRRelu6(self, t, domain='relu6'):
-    """Quantizes the output of a softmax (0, 1.0)."""
+    """Quantizes the output of a relu6 (0, 6.0)."""
     qd = self.GetQDomain(domain)
     return qd.QuantizeNaturalRange(t, 0.0, 6.0) if qd else t
 
@@ -310,6 +314,9 @@ class QuantizableLayer(base_layer.BaseLayer):
         qdomain = kwargs.get('qdomain')
         if qdomain is not None:
           del kwargs['qdomain']
+        narrow_to_asym_bit_depth = kwargs.get('narrow_to_asym_bit_depth')
+        if narrow_to_asym_bit_depth is not None:
+          del kwargs['narrow_to_asym_bit_depth']
         if qmin is None:
           qmin = default_qmin
         if qmax is None:
@@ -331,6 +338,9 @@ class QuantizableLayer(base_layer.BaseLayer):
         else:
           qd = self.GetQDomain(qdomain)
           if qd:
+            if narrow_to_asym_bit_depth:
+              qrange = qmax - qmin
+              qmax = qmin + qrange * (2**qd.bits - 1) / (2**qd.bits)
             y = qd.QuantizeNaturalRange(y, qmin, qmax)
         return y
 
@@ -349,6 +359,11 @@ class QuantizableLayer(base_layer.BaseLayer):
     WrapOp('qlogsoftmax', tf.nn.log_softmax)
     WrapOp('qrelu', tf.nn.relu)
     WrapOp('qrelu6', tf.nn.relu6, default_qmin=0.0, default_qmax=6.0)
+    WrapOp(
+        'qrandom_uniform',
+        tf.random_uniform,
+        default_qmin=0.0,
+        default_qmax=1.0)
 
     # Convenience for quantizing weights.
     self.AddFunction('qweight', self.QWeight)
@@ -487,17 +502,6 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
     p.name = 'CCSchedule'
     return p
 
-  @base_layer.initializer
-  def __init__(self, params):
-    super(LinearClippingCapSchedule, self).__init__(params)
-    p = self.params
-    cap_pc = py_utils.WeightParams(
-        shape=[],
-        init=py_utils.WeightInit.Constant(p.start_cap),
-        dtype=tf.float32,
-        collections=[self.__class__.__name__ + '_vars'])
-    self.CreateVariable('cap', cap_pc, trainable=False)
-
   @property
   def is_quantized(self):
     return False
@@ -506,7 +510,7 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
     return tf.clip_by_value(x, min_value, max_value)
 
   def GetState(self, theta):
-    return self.CurrentCap(theta)
+    return self._Value(theta.global_step)
 
   def ApplyClippingWithState(self, state, x):
     """Applies clipping to x.
@@ -530,20 +534,8 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
     """
     return (-self.params.end_cap, self.params.end_cap)
 
-  def CurrentCap(self, theta):
-    """Returns the current clipping cap value."""
-    return tf.stop_gradient(theta.cap)
-
-  def Value(self, current_step):
-    """Returns the current clipping cap.
-
-    Args:
-      current_step: The current global step value.
-
-    Returns:
-      Returns the current clipping cap value given the current training
-      global step.
-    """
+  def _Value(self, current_step):
+    """Returns the current clipping cap."""
     p = self.params
     start_step = tf.cast(p.start_step, tf.float32)
     end_step = tf.cast(p.end_step, tf.float32)
@@ -558,11 +550,8 @@ class LinearClippingCapSchedule(BaseClippingCapSchedule):
                    lambda: tf.to_float(rmax_tensor))
 
   def PostTrainingStepUpdate(self, global_step):
-    """Update the cap value."""
-    p = self.params
-    cap = self.Value(global_step)
-    summary_utils.scalar('cap', cap)
-    return self.vars.cap.assign(cap)
+    summary_utils.scalar('cap', self._Value(global_step))
+    return tf.no_op()
 
 
 class FakeQuantizationSchedule(BaseClippingCapSchedule):
@@ -597,25 +586,15 @@ class FakeQuantizationSchedule(BaseClippingCapSchedule):
     # how it would work otherwise.
     assert p.quant_start_step >= p.clip_end_step, (
         'quant_start_step must be >= clip_end_step')
-    if not p.is_inference:
-      clip_ratio_pc = py_utils.WeightParams(
-          shape=[],
-          init=py_utils.WeightInit.Constant(-1.0
-                                            if p.clip_start_step > 0 else 0.0),
-          dtype=tf.float32,
-          collections=[self.__class__.__name__ + '_vars'])
-      self.CreateVariable('clip_ratio', clip_ratio_pc, trainable=False)
-      fq_ratio_pc = py_utils.WeightParams(
-          shape=[],
-          init=py_utils.WeightInit.Constant(-1.0
-                                            if p.quant_start_step > 0 else 0.0),
-          dtype=tf.float32,
-          collections=[self.__class__.__name__ + '_vars'])
-      self.CreateVariable('fq_ratio', fq_ratio_pc, trainable=False)
 
   @property
   def is_quantized(self):
     return True
+
+  @property
+  def bits(self):
+    p = self.params
+    return p.bits
 
   def GetEndRange(self):
     """Public method to get the final range as a constant.
@@ -660,11 +639,27 @@ class FakeQuantizationSchedule(BaseClippingCapSchedule):
 
   def GetState(self, theta):
     """Gets the state from theta."""
-    if self.params.is_inference:
+    p = self.params
+    if p.is_inference:
       # State is not used for inference. Just return dummy.
       return tf.zeros([1], tf.float32)
     else:
-      return tf.stack([theta.clip_ratio, theta.fq_ratio])
+      # Calculations/vars need to be float but these can be ints in the params.
+      clip_end_step = tf.cast(p.clip_end_step, tf.float32)
+      clip_start_step = tf.cast(p.clip_start_step, tf.float32)
+      quant_start_step = tf.cast(p.quant_start_step, tf.float32)
+      global_step = tf.cast(theta.global_step, tf.float32)
+
+      # Will be negative if before clipping starts.
+      clip_ratio = (
+          tf.minimum(clip_end_step - clip_start_step,
+                     global_step - clip_start_step) /
+          tf.maximum(1.0, clip_end_step - clip_start_step))
+      # Currently fq is either on (1.0) or off (-1.0). Progressive quantization
+      # may later occupy 0..1.0.
+      fq_ratio = tf.where(global_step < quant_start_step, -1.0, 1.0)
+
+      return tf.stack([clip_ratio, fq_ratio])
 
   def _GetQuantizedRangeForCap(self, current_cap, bits):
     """Gets the range for the given cap and number of bits.
@@ -773,31 +768,6 @@ class FakeQuantizationSchedule(BaseClippingCapSchedule):
     # return _CopyShape(x, Clipped())
     return _CopyShape(x, tf.where(fq_ratio <= 0.0, Clipped(), Quantized()))
 
-  def PostTrainingStepUpdate(self, global_step):
-    """Update the cap value."""
-    p = self.params
-    if p.is_inference:
-      return
-
-    # Calculations/vars need to be float but these can be ints in the params.
-    clip_end_step = tf.cast(p.clip_end_step, tf.float32)
-    clip_start_step = tf.cast(p.clip_start_step, tf.float32)
-    quant_start_step = tf.cast(p.quant_start_step, tf.float32)
-    global_step = tf.cast(global_step, tf.float32)
-
-    # Will be negative if before clipping starts.
-    new_clip_ratio = (
-        tf.minimum(clip_end_step - clip_start_step, global_step -
-                   clip_start_step) / (clip_end_step - clip_start_step))
-    # Currently fq is either on (1.0) or off (-1.0). Progressive quantization
-    # may later occupy 0..1.0.
-    new_fq_ratio = tf.where(global_step < quant_start_step, -1.0, 1.0)
-    summary_utils.scalar('clip_ratio', new_clip_ratio)
-    summary_utils.scalar('fq_ratio', new_fq_ratio)
-    return tf.group(
-        self.vars.clip_ratio.assign(new_clip_ratio),
-        self.vars.fq_ratio.assign(new_fq_ratio))
-
 
 class QDomain(base_layer.BaseLayer):
   """Base class for a quantization domain layer.
@@ -805,37 +775,14 @@ class QDomain(base_layer.BaseLayer):
   This implementation doubles as a no-op quantization domain.
   """
 
-  @base_layer.initializer
-  def __init__(self, params):
-    super(QDomain, self).__init__(params)
-    self._global_step_enabled = False
+  @property
+  def bits(self):
+    """Retrieves the bits used by this quantization layer.
 
-  def _EnableGlobalStepAccess(self):
-    """Called by subclass init to initialize the global step counter.
-
-    Should be called from __init__ in an appropriate variable scope. Will add
-    a 'global_step' variable to the layer and a post step update to manage
-    it.
+    Returns:
+      The number of bits available to this qdomain or None if unquantized.
     """
-    if self._global_step_enabled:
-      return
-    self._global_step_enabled = True
-    global_step_pc = py_utils.WeightParams(
-        shape=[],
-        init=py_utils.WeightInit.Constant(0),
-        dtype=tf.int64,
-        collections=[self.__class__.__name__ + '_vars'])
-    self.CreateVariable('global_step', global_step_pc, trainable=False)
-
-  def PostTrainingStepUpdate(self, global_step):
-    """Update the cap value."""
-    super_op = super(QDomain, self).PostTrainingStepUpdate(global_step)
-    if not self._global_step_enabled:
-      return super_op
-    return tf.group([
-        super_op,
-        self.vars.global_step.assign(global_step),
-    ])
+    return None
 
   def QuantizeWeight(self, w):
     """Quantizes a weight.
@@ -914,32 +861,36 @@ class QDomain(base_layer.BaseLayer):
     raise NotImplementedError('Abstract method: NormalizeTensors')
 
 
-class SymetricScheduledClipQDomain(QDomain):
-  """A quantization domain that does symetric scheduled clipping.
+class SymmetricScheduledClipQDomain(QDomain):
+  """A quantization domain that does symmetric scheduled clipping.
 
   This contains a BaseClippingCapSchedule which handles the actual clipping. It
   defaults to a FakeQuantizationSchedule.
 
   This clipping domain will aid in quantizing layers that are known to tolerate
   operation within known ranges (such as LSTM cells). The clipping range will
-  converge over a range of steps and is setup to match ideal, symetric ranges
+  converge over a range of steps and is setup to match ideal, symmetric ranges
   for quantized types.
   """
 
   @classmethod
   def Params(cls):
-    p = super(SymetricScheduledClipQDomain, cls).Params()
+    p = super(SymmetricScheduledClipQDomain, cls).Params()
     p.Define('cc_schedule', FakeQuantizationSchedule.Params(),
              'Quantization clipping schedule.')
     return p
 
   @base_layer.initializer
   def __init__(self, params):
-    super(SymetricScheduledClipQDomain, self).__init__(params)
+    super(SymmetricScheduledClipQDomain, self).__init__(params)
     p = self.params
 
     with tf.variable_scope(p.name):
       self.CreateChild('cc_schedule', p.cc_schedule)
+
+  @property
+  def bits(self):
+    return self.cc_schedule.bits
 
   def QuantizeWeight(self, w):
     return self.cc_schedule.ApplyClipping(self.theta.cc_schedule, w)
@@ -947,7 +898,7 @@ class SymetricScheduledClipQDomain(QDomain):
   def QuantizeNaturalRange(self, t, min_value, max_value):
     # Note: We apply the scheduled clip here, completely overriding the
     # known natural range. This is intentional and assumes that when this
-    # layer is used for symetric clipping, it is applied uniformly to all
+    # layer is used for symmetric clipping, it is applied uniformly to all
     # active elements.
     return self.cc_schedule.ApplyClipping(self.theta.cc_schedule, t)
 
@@ -991,7 +942,7 @@ class _CountedMinMaxAccumulator(base_layer.Accumulator):
 
 
 class PassiveAsymQDomain(QDomain):
-  """A quantization domain that does passive, asymetric quantization.
+  """A quantization domain that does passive, asymmetric quantization.
 
   See: https://arxiv.org/abs/1712.05877
 
@@ -1030,8 +981,6 @@ class PassiveAsymQDomain(QDomain):
 
     # Save a scope for lazily created variables.
     with tf.variable_scope(p.name + '/q'):
-      if p.delay_start_steps > 0:
-        self._EnableGlobalStepAccess()
       self._qvars_scope = tf.get_variable_scope()
 
   def _MaybeFakeQuant(self, inputs, min_v, max_v, num_bits):
@@ -1048,6 +997,11 @@ class PassiveAsymQDomain(QDomain):
                       inputs)
     else:
       return Apply()
+
+  @property
+  def bits(self):
+    p = self.params
+    return p.bits
 
   def QuantizeWeight(self, w):
     p = self.params

@@ -18,11 +18,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections as py_collections
 import contextlib
 import hashlib
 import math
+import numbers
 import re
 import traceback
+import zlib
 
 import numpy as np
 import six
@@ -33,10 +36,13 @@ import tensorflow as tf
 from tensorflow.contrib.model_pruning.python.layers import core_layers as pruning_layers
 from tensorflow.contrib.tpu.python.tpu import tpu
 from tensorflow.contrib.tpu.python.tpu import tpu_function
+from tensorflow.core.framework import node_def_pb2
 from tensorflow.core.protobuf import rewriter_config_pb2
+from tensorflow.python.framework import function
 from tensorflow.python.util import deprecation
 from lingvo.core import hyperparams
 from lingvo.core import retry
+from lingvo.core import tshape
 from lingvo.core.ops import py_x_ops
 
 tf.flags.DEFINE_bool('enable_asserts', True,
@@ -51,6 +57,8 @@ tf.flags.DEFINE_bool('print_debug_tensors', False,
 tf.flags.DEFINE_string(
     'xla_device', '', 'If non-empty, can be cpu, gpu, or tpu (case sensitive)')
 
+tf.flags.DEFINE_bool('nas_run', False, 'If True, this is a NAS training run.')
+
 tf.flags.DEFINE_bool(
     'use_resource_var', False,
     'Use ResourceVariable instead of Variable; this option is '
@@ -63,10 +71,27 @@ tf.flags.DEFINE_bool(
     'with variables or a checkpoint that will be produced '
     'or consumed by TPU')
 
+tf.flags.DEFINE_bool(
+    'pin_vars_to_cpu', False,
+    'Pin variables to cpu:0.  This is useful for weight-sharing / multi-core '
+    'inference on TPUs in which TPU core variables are managed via '
+    'TPUPartitionedCallOp.')
+
+tf.flags.DEFINE_bool(
+    'no_identity_on_vars', False,
+    'Do not add tf.identity() on vars. This allows TPUPartitionedCallOp to use'
+    'variable handles directly for weight-sharing / multi-core '
+    'inference on TPUs.')
+
 FLAGS = tf.flags.FLAGS
 
 ENQUEUE_OPS = '__lingvo_enqueue_ops'
 CLOSE_QUEUE_OPS = '__lingvo_close_queue_ops'
+
+TPU_EMBEDDING_LOAD_OPS = '__lingvo_tpu_embedding_load_ops'
+TPU_EMBEDDING_RETRIEVE_OPS = '__lingvo_tpu_embedding_retrieve_ops'
+TPU_EMBEDDING = '__tpu_embedding'
+TPU_EMBEDDING_ACTIVATIONS = '__tpu_embedding_activations'
 
 # pylint: disable=protected-access
 deprecation._PRINT_DEPRECATION_WARNINGS = False
@@ -206,7 +231,7 @@ def Log(value, prefix, **kwargs):
 
 
 def _Save(steps, prefix, key, val):
-  filename = '%s.%08d.%s.npy' % (prefix, steps, key)
+  filename = '%s.%08d.%s.npy' % (prefix.decode(), steps, key.decode())
   with tf.gfile.Open(filename, 'w') as outfile:
     np.save(outfile, val)
 
@@ -230,7 +255,7 @@ def Save(value, filename_prefix, **kwargs):
     value is returned.
   """
   last = value
-  steps = GetOrCreateGlobalStep()
+  steps = GetGlobalStep()
   for k in sorted(kwargs):
     with tf.control_dependencies([last]):
       last = tf.py_func(_Save, [steps, filename_prefix, k, kwargs[k]], [])
@@ -241,7 +266,9 @@ def Save(value, filename_prefix, **kwargs):
 def HasRank(tensor, expected_rank):
   """Syntactic sugar for asserting that tensor has the expected rank."""
   if tensor.shape.ndims is not None and isinstance(expected_rank, int):
-    assert tensor.shape.ndims == expected_rank
+    assert tensor.shape.ndims == expected_rank, (
+        'Ranks did not match, got %d, '
+        'expected %d') % (tensor.shape.ndims, expected_rank)
     return tensor
   if FLAGS.enable_asserts:
     return with_dependencies([tf.assert_equal(tf.rank(tensor), expected_rank)],
@@ -250,14 +277,27 @@ def HasRank(tensor, expected_rank):
     return tensor
 
 
-def HasShape(tensor, expected_shape):
-  """Syntactic sugar for asserting that tensor has the expected shape."""
+def HasShape(tensor, expected_shape, ndims=None):
+  """Syntactic sugar for asserting that tensor has the expected shape.
+
+  Args:
+    tensor: A Tensor.
+    expected_shape: A Python list or a 1D tensor.
+    ndims: If not None, check only the first `ndims` dimensions of `tensor`.
+      Must be equal to the length of `expected_shape` if not None.
+
+  Returns:
+    The input `tensor`
+  Raises:
+    A runtime error if the assertion fails.
+  """
   if FLAGS.enable_asserts:
     filepath, line, func, _ = traceback.extract_stack(limit=3)[-2]
-    msg = 'LINGVO ASSERT %s:%s(%s)' % (re.sub(r'.*/', '', filepath), line,
-                                          func)
+    msg = 'LINGVO ASSERT %s:%s(%s)' % (re.sub(r'.*/', '',
+                                                 filepath), line, func)
     return with_dependencies([
-        py_x_ops.assert_shape_match(tf.shape(tensor), expected_shape, msg=msg)
+        py_x_ops.assert_shape_match(
+            tf.shape(tensor)[:ndims], expected_shape, msg=msg)
     ], tensor)
   else:
     return tensor
@@ -273,6 +313,7 @@ def GetShape(tensor, ndims=None):
     tensor: The input tensor.
     ndims: If not None, returns the shapes for the first `ndims` dimensions.
   """
+  tensor = tf.convert_to_tensor(tensor)
   shape = tf.shape(tensor)
   if ndims is None:
     ndims = tensor.shape.ndims
@@ -301,6 +342,10 @@ def use_tpu():  # pylint: disable=invalid-name
   return res
 
 
+def nas_run():  # pylint: disable=invalid-name
+  return FLAGS.nas_run
+
+
 def tpu_compat():  # pylint: disable=invalid-name
   return use_tpu() or FLAGS.tpu_compatible
 
@@ -315,20 +360,10 @@ def outside_all_rewrites():
     yield
 
 
-def _MakeFnPinComputationToHostDevice(func):
-  """Pin func to host device."""
-
-  def _WrapperFn(*args, **kwargs):
-    with tf.device('/replica:0/task:0/device:CPU:*'):
-      return func(*args, **kwargs)
-
-  return _WrapperFn
-
-
 def RunOnTpuHost(func, *args, **kwargs):
-  """Runs the given function call on TPU host.
+  r"""Runs the given function call on TPU host.
 
-  Invokes func(*args, **kwargs) directly if not running on tpu.
+  Invokes func(\*args, \*\*kwargs) directly if not running on tpu.
 
   Args:
     func: the function to invoke.
@@ -337,8 +372,7 @@ def RunOnTpuHost(func, *args, **kwargs):
     The function return value.
   """
   if use_tpu():
-    return tpu.outside_compilation(
-        _MakeFnPinComputationToHostDevice(func), *args, **kwargs)
+    return tpu.outside_compilation(func, *args, **kwargs)
   else:
     return func(*args, **kwargs)
 
@@ -415,11 +449,14 @@ class NestedMap(dict):
     try:
       return super(NestedMap, self).__getattribute__(key)
     except AttributeError as e:
-      raise AttributeError(
-          '%s; available attributes: %s' % (e, self.__dict__.keys()))
+      raise AttributeError('%s; available attributes: %s' %
+                           (e, self.__dict__.keys()))
 
   def copy(self):  # Don't delegate w/ super: dict.copy() -> dict.
     return NestedMap(self)
+
+  def __deepcopy__(self, unused_memo):
+    return self.DeepCopy()
 
   def DeepCopy(self):
     flat_v = self.Flatten()
@@ -452,6 +489,8 @@ class NestedMap(dict):
   def FlattenItems(self):
     """Flatten the `.NestedMap` and returns <key, value> pairs in a list.
 
+    For lists, keys will be returned with `_<idx>` appended, e.g. `x.y_10.z`.
+
     Returns:
       A list of <key, value> pairs, where keys for nested entries will be
       represented in the form of `foo.bar`.
@@ -466,8 +505,8 @@ class NestedMap(dict):
         return ret
       elif isinstance(v, list):
         ret = []
-        for x in v:
-          ret += Expand(key, x)
+        for i, x in enumerate(v):
+          ret += Expand('%s_%d' % (key, i), x)
         return ret
       else:
         return [(key, v)]
@@ -496,29 +535,50 @@ class NestedMap(dict):
 
   def Filter(self, fn):
     """Returns a copy of this `.NestedMap` with entries that fn(entry) is True."""
+    return self.FilterKeyVal(lambda _, v: fn(v))
 
-    def DoFilter(v):
-      if isinstance(v, NestedMap):
-        return v.Filter(fn)
-      elif isinstance(v, list):
+  def FilterKeyVal(self, fn):
+    """Returns a copy of this `.NestedMap` with filtered by fn.
+
+    If fn(key, entry) is True, the entry is copied into the returned NestedMap.
+    Otherwise, it is not copied.
+    For lists, keys will be processed with indices, e.g. `x.y[10].z`.
+    This is different from FlattenItems.
+
+    Args:
+      fn: a callable of (string, entry)->boolean.
+
+    Returns:
+      A `.NestedMap` contains copied entries from this `'.NestedMap`.
+    """
+
+    def DoFilter(prefix, value):
+      """Recursively copy value with the filter fn applied."""
+      if isinstance(value, NestedMap):
+        ret = NestedMap()
+        for k in sorted(value.keys()):
+          v = value[k]
+          if prefix:
+            key = '%s.%s' % (prefix, k)
+          else:
+            key = k
+          filtered = DoFilter(key, v)
+          if filtered is not None:
+            ret[k] = filtered
+        return ret if len(ret) else None
+      elif isinstance(value, list):
         lst = []
-        for x in v:
-          filtered = DoFilter(x)
+        for i, x in enumerate(value):
+          filtered = DoFilter('%s[%d]' % (prefix, i), x)
           if filtered is not None:
             lst += [filtered]
         return lst if lst else None
-      elif fn(v):
-        return v
+      elif fn(prefix, value):
+        return value
       else:
         return None
 
-    ret = NestedMap()
-    for k in sorted(self.keys()):
-      filtered = DoFilter(self[k])
-      if filtered is not None:
-        ret[k] = filtered
-
-    return ret if len(ret) else None
+    return DoFilter('', self)
 
   def Pack(self, lst):
     """Returns a copy of this with each value replaced by a value in lst."""
@@ -651,6 +711,64 @@ def ReadOnlyAttrDictView(backing):
   return Wrapper()
 
 
+class RNNCellStateInit(object):
+  """State initialization functions for RNN cell init state."""
+
+  @staticmethod
+  def _Params(method, seed):
+    p = hyperparams.Params()
+    p.Define('method', method,
+             'Initialization method. Should be one of zeros, random_normal.')
+    p.Define('seed', seed, 'Random seed used to generate initial values.')
+    p.Freeze()
+    return p
+
+  @staticmethod
+  def Zeros():
+    """tf.zeros()."""
+    return RNNCellStateInit._Params('zeros', seed=None)
+
+  @staticmethod
+  def RandomNormal(seed=None):
+    """tf.random.normal()."""
+    return RNNCellStateInit._Params('random_normal', seed)
+
+
+def DefaultRNNCellStateInit():
+  return RNNCellStateInit.Zeros()
+
+
+def InitRNNCellState(shape, init=None, dtype=None, name=None):
+  """Initial state definitions for RNN cell implementations.
+
+  Args:
+    shape: A array of ints for specifying the shape of the state.
+    init: Hyperparameters as returned by one of the static implemetaitons in
+      RNNCellStateInit.
+    dtype: The dype of the states. Defaults to tf.float32.
+    name: An optional name for the operation.
+
+  Returns:
+    A Tensor of the specified shape, and sampled from the distribution as
+    defined by the init parameters.
+  """
+  if init is None:
+    init = DefaultRNNCellStateInit()
+  if dtype is None:
+    dtype = tf.float32
+
+  method = init.method
+  if method in ['zeros']:
+    init_state = tf.zeros(shape=shape, dtype=dtype, name=name)
+  elif method in ['random_normal']:
+    init_state = tf.random.normal(
+        shape=shape, dtype=dtype, name=name, seed=init.seed)
+  else:
+    raise ValueError('zero_state method (%s) not supported.' % method)
+
+  return init_state
+
+
 class WeightInit(object):
   """Static class providing weight initialization config params."""
 
@@ -674,9 +792,19 @@ class WeightInit(object):
     return WeightInit._Params('uniform', scale, seed)
 
   @staticmethod
+  def UniformPositive(scale=1.0, seed=None):
+    """scale * tf.random_uniform(0., 1.0)."""
+    return WeightInit._Params('uniform_positive', scale, seed)
+
+  @staticmethod
   def Xavier(scale=1.0, seed=None):
     """Xavier initialization (x = sqrt(6. / (in + out)); [-x, x])."""
     return WeightInit._Params('xavier', scale, seed)
+
+  @staticmethod
+  def GeoMeanXavier(scale=1.0, seed=None):
+    """A variant of Xavier (x = sqrt(3. / sqrt(in * out)); [-x, x])."""
+    return WeightInit._Params('geo_mean_xavier', scale, seed)
 
   @staticmethod
   def Constant(scale=1.0):
@@ -694,6 +822,16 @@ class WeightInit(object):
     return WeightInit._Params('gaussian_sqrt_dim', scale, seed)
 
   @staticmethod
+  def GaussianSqrtFanIn(scale=1.0, seed=None):
+    """scale * tf.random_normal(0, 1 / sqrt(fan_in))."""
+    return WeightInit._Params('gaussian_sqrt_fanin', scale, seed)
+
+  @staticmethod
+  def GaussianSqrtFanOut(scale=1.0, seed=None):
+    """scale * tf.random_normal(0, 1 / sqrt(fan_out))."""
+    return WeightInit._Params('gaussian_sqrt_fanout', scale, seed)
+
+  @staticmethod
   def UniformSqrtDim(scale=1.0, seed=None):
     """scale * tf.uniform(-1 / sqrt(dim0), 1 / sqrt(dim0))."""
     return WeightInit._Params('uniform_sqrt_dim', scale, seed)
@@ -707,6 +845,24 @@ class WeightInit(object):
   def TruncatedGaussianSqrtDim(scale=1.0, seed=None):
     """scale * tf.truncated_normal(0, 1 / sqrt(dim0))."""
     return WeightInit._Params('truncated_gaussian_sqrt_dim', scale, seed)
+
+  @staticmethod
+  def TruncatedGaussianSqrtFanIn(scale=1.0, seed=None):
+    """scale * tf.truncated_normal(0, 1 / sqrt(fan_in))."""
+    return WeightInit._Params('truncated_gaussian_sqrt_fanin', scale, seed)
+
+  @staticmethod
+  def TruncatedGaussianSqrtFanOut(scale=1.0, seed=None):
+    """scale * tf.truncated_normal(0, 1 / sqrt(fan_out))."""
+    return WeightInit._Params('truncated_gaussian_sqrt_fanout', scale, seed)
+
+  @staticmethod
+  def KaimingUniformFanInRelu(scale=1.0, seed=None):
+    return WeightInit._Params('kaiming_uniform_fanin_relu', scale, seed)
+
+  @staticmethod
+  def KaimingUniformFanInLeakyRelu(scale=np.sqrt(5.), seed=None):
+    return WeightInit._Params('kaiming_uniform_fanin_leakyrelu', scale, seed)
 
 
 _DEFAULT_XAVIER_INIT = 1.000001
@@ -737,7 +893,6 @@ def WeightParams(shape, init=None, dtype=None, collections=None):
   p.Define('init', init, 'Initialization method.')
   p.Define('collections', collections,
            'Variable collections this weight belongs to.')
-  p.Freeze()
   return p
 
 
@@ -745,7 +900,7 @@ def FindNeeded(endpoints):
   """List names of tensors and operations required to compute endpoints."""
   names_seen = set()
   queue = []
-  for e in tf.contrib.framework.nest.flatten(endpoints):
+  for e in tf.nest.flatten(endpoints):
     if isinstance(e, tf.Operation):
       queue.append(e)
     else:
@@ -798,8 +953,8 @@ _get_opportunistic_variable_reuse = _CollectionGetter(
 
 _VARIABLE_RENAME_RULES_KEY = ('__lingvo_variable_rename_rules',)
 
-_get_rename_rules_stack = _CollectionGetter(_VARIABLE_RENAME_RULES_KEY,
-                                            lambda: [])
+_get_rename_rules_stack = _CollectionGetter(
+    _VARIABLE_RENAME_RULES_KEY, lambda: [])
 
 
 @contextlib.contextmanager
@@ -866,6 +1021,24 @@ _ALL_VARS_KEY = ('__lingvo_all_vars',)
 _get_all_vars = _CollectionGetter(_ALL_VARS_KEY, lambda: {})
 
 
+def GetFanInFanOut(shape):
+  """Returns (fan_in, fan_out) of a weight variable of the give shape."""
+  if not shape:
+    return None, None
+  if len(shape) < 1:
+    return 1, 1
+  elif len(shape) == 1:
+    # Following _compute_fans() from TF's init_ops.py.
+    return shape[0], shape[0]
+  else:
+    receptive_field_size = 1
+    for s in shape[:-2]:
+      receptive_field_size *= s
+    fan_in = shape[-2] * receptive_field_size
+    fan_out = shape[-1] * receptive_field_size
+    return fan_in, fan_out
+
+
 # TODO(yonghui): Add support for partitioned Variables.
 def CreateVariable(name,
                    params,
@@ -890,7 +1063,8 @@ def CreateVariable(name,
 
   Returns:
     tf.identity(var), var pair. The tf.identity() node is colocated
-    with var.
+    with var. In the case of FLAGS.no_identity_on_vars, simply returns
+    a var, var pair.
   """
   p = params.Copy()
   assert isinstance(p, hyperparams.Params)
@@ -900,7 +1074,7 @@ def CreateVariable(name,
   if shape:
     assert all([dim_size > 0 for dim_size in shape]), ('%s' % shape)
     dim0 = shape[0]
-  assert p.init.scale >= 0 or p.init.method == 'constant'
+  assert np.all(p.init.scale >= 0) or p.init.method == 'constant'
   method = p.init.method
   scale = p.init.scale
   seed = p.init.seed
@@ -922,47 +1096,76 @@ def CreateVariable(name,
   if (method in [
       'gaussian_sqrt_dim', 'uniform_sqrt_dim', 'truncated_gaussian_sqrt_dim'
   ]):
+    if len(shape) > 2:
+      # This is probably not the right method to use when len(shape) > 2,
+      # e.g. dim0 will be 3 with a 3x3 conv2d kernel.
+      tf.logging.warn(
+          'Initializing %s of shape %s with method %s: dim0=%s. '
+          'Make sure that it is intended.', name, shape, method, dim0)
     scale *= 1.0 / math.sqrt(dim0)
 
+  if method in ['gaussian_sqrt_fanin', 'truncated_gaussian_sqrt_fanin']:
+    fan_in, _ = GetFanInFanOut(shape)
+    if fan_in is not None:
+      scale *= 1.0 / math.sqrt(fan_in)
+  if method in ['gaussian_sqrt_fanout', 'truncated_gaussian_sqrt_fanout']:
+    _, fan_out = GetFanInFanOut(shape)
+    if fan_out is not None:
+      scale *= 1.0 / math.sqrt(fan_out)
+
   init_dtype = dtype.real_dtype
-  if method in ['gaussian', 'gaussian_sqrt_dim']:
+  if method in [
+      'gaussian', 'gaussian_sqrt_dim', 'gaussian_sqrt_fanin',
+      'gaussian_sqrt_fanout'
+  ]:
     v_init = tf.random_normal_initializer(
         mean=0.0, stddev=scale, seed=seed, dtype=init_dtype)
   elif method in ['uniform', 'uniform_sqrt_dim']:
     v_init = tf.random_uniform_initializer(
         minval=-scale, maxval=scale, seed=seed, dtype=init_dtype)
+  elif method in ['uniform_positive']:
+    v_init = tf.random_uniform_initializer(
+        minval=0.0, maxval=scale, seed=seed, dtype=init_dtype)
   elif method in ['uniform_unit_scaling']:
     v_init = tf.uniform_unit_scaling_initializer(
         factor=scale, seed=seed, dtype=init_dtype)
-  elif method in ['truncated_gaussian', 'truncated_gaussian_sqrt_dim']:
+  elif method in [
+      'truncated_gaussian', 'truncated_gaussian_sqrt_dim',
+      'truncated_gaussian_sqrt_fanin', 'truncated_gaussian_sqrt_fanout'
+  ]:
     v_init = tf.truncated_normal_initializer(
         mean=0.0, stddev=scale, seed=seed, dtype=init_dtype)
   elif method in ['constant']:
     v_init = tf.constant_initializer(value=scale, dtype=init_dtype)
-  elif method in ['xavier']:
+  elif method in ['xavier', 'geo_mean_xavier']:
     # pylint: disable=unused-argument
     def XavierUniform(shape, dtype, partition_info):
       """Xavier initialization (x = sqrt(6. / (in + out)); scale*[-x, x])."""
       if not shape:
         raise ValueError(
             '\'shape\' must not be \'None\' or 0 for XavierUniform')
-      if len(shape) < 1:
-        fan_in = 1
-        fan_out = 1
-      elif len(shape) == 1:
-        fan_in = shape[0]
-        fan_out = shape[0]
-      else:
-        receptive_field_size = 1
-        for s in shape[:-2]:
-          receptive_field_size *= s
-        fan_in = shape[-2] * receptive_field_size
-        fan_out = shape[-1] * receptive_field_size
-      limit = math.sqrt(6. / (fan_in + fan_out))
+      fan_in, fan_out = GetFanInFanOut(shape)
+      if method == 'xavier':
+        limit = math.sqrt(6. / (fan_in + fan_out))
+      elif method == 'geo_mean_xavier':
+        limit = math.sqrt(3. / math.sqrt(fan_in * fan_out))
       return scale * tf.random_uniform(shape, -limit, limit, dtype, seed)
 
     # pylint: enable=unused-argument
     v_init = XavierUniform
+  elif method in [
+      'kaiming_uniform_fanin_relu', 'kaiming_uniform_fanin_leakyrelu'
+  ]:
+    fan_in = np.prod(shape[:-1])
+    if method == 'kaiming_uniform_fanin_leakyrelu':
+      # Assume the 'a' parameter is the 'scale' argument.
+      gain = np.sqrt(2. / (1 + scale**2))
+    else:
+      gain = np.sqrt(2.)
+    std_dev = gain / np.sqrt(fan_in)
+    bound = np.sqrt(3.0) * std_dev
+    v_init = tf.random_uniform_initializer(
+        minval=-bound, maxval=bound, seed=seed, dtype=init_dtype)
   else:
     assert False, 'init_type not supported.'
   if init_wrapper:
@@ -999,14 +1202,25 @@ def CreateVariable(name,
           use_resource=scope.use_resource or use_resource_variables())
     with tf.variable_scope(var_scope), \
         tf.variable_scope(var_name, reuse=reuse) as scope:
-      return tf.get_variable(
-          'var',
-          shape,
-          dtype,
-          v_init,
-          collections=collections,
-          trainable=trainable,
-          validate_shape=True if shape is not None else False)
+      if FLAGS.pin_vars_to_cpu:
+        with tf.device('/cpu:0'):
+          return tf.get_variable(
+              'var',
+              shape,
+              dtype,
+              v_init,
+              collections=collections,
+              trainable=trainable,
+              validate_shape=True if shape is not None else False)
+      else:
+        return tf.get_variable(
+            'var',
+            shape,
+            dtype,
+            v_init,
+            collections=collections,
+            trainable=trainable,
+            validate_shape=True if shape is not None else False)
 
   if _get_opportunistic_variable_reuse()[0]:
     try:
@@ -1029,19 +1243,49 @@ def CreateVariable(name,
     for col in p.collections:
       tf.add_to_collection(col, var)
 
-  # This tf.identity colocated with var.
-  with tf.device(var.device):
-    return tf.identity(var), var
+  if FLAGS.no_identity_on_vars:
+    with tf.device(var.device):
+      return var, var
+  else:
+    # This tf.identity colocated with var.
+    with tf.device(var.device):
+      return tf.identity(var), var
 
 
 global_variable_scope = tf.get_variable_scope()
 
+_GLOBAL_STEP_STACK = []
 
-def GetOrCreateGlobalStep():
-  """Create if needed and return the global_step."""
+
+@contextlib.contextmanager
+def GlobalStepContext(global_step_tensor):
+  _GLOBAL_STEP_STACK.append(global_step_tensor)
+  yield
+  _GLOBAL_STEP_STACK.pop()
+
+
+def GetGlobalStep():
+  """Return the global_step."""
+  if _GLOBAL_STEP_STACK:
+    return _GLOBAL_STEP_STACK[-1]
+  return tf.train.get_global_step()
+
+
+def GetOrCreateGlobalStepVar():
+  """Return the global_step variable, creating it if it does not exist.
+
+  Prefer GetGlobalStep if a tensor rather than a tf.Variable is sufficient.
+  """
   with tf.variable_scope(
       global_variable_scope, use_resource=use_resource_variables()):
     return tf.train.get_or_create_global_step()
+
+
+def LogMultiLines(label, lines):
+  if not isinstance(lines, (list, tuple)):
+    lines = lines.split('\n')
+  for line in lines:
+    tf.logging.info('%s: %s', label, line)
 
 
 def _LogPlacement(label, theta, copy):
@@ -1052,11 +1296,11 @@ def _LogPlacement(label, theta, copy):
     return [x.device for x in m.Flatten()]
 
   tf.logging.info('=== %s ===', label)
-  tf.logging.info(
-      '%s',
-      theta.Pack(
-          [('%s -> %s' % (x[0], x[1]))
-           for x in zip(GetDevices(theta), GetDevices(copy))]).DebugString())
+  LogMultiLines(
+      label,
+      theta.Pack([('%s -> %s' % (x[0], x[1]))
+                  for x in zip(GetDevices(theta), GetDevices(copy))
+                 ]).DebugString())
   tf.logging.info('==========')
 
 
@@ -1111,6 +1355,7 @@ def _GetVarsToLoad(all_vars, variable_loading_rules, var_ignore_rules):
       checkpoint_var_name = name_format % match.groups()
       if checkpoint_var_name.endswith(':0'):
         checkpoint_var_name = checkpoint_var_name[:-2]
+      tf.logging.info('Loading %s from %s', model_var, checkpoint_var_name)
       vars_to_load.append((checkpoint_var_name, model_var))
   return vars_to_load
 
@@ -1121,7 +1366,8 @@ def _OverrideVarsFromCheckpoint(sess, all_vars, checkpoint_path,
   vars_to_load = _GetVarsToLoad(all_vars, variable_loading_rules,
                                 var_ignore_rules)
   if not vars_to_load:
-    raise ValueError('Variable loading rules did not match any vars.')
+    raise ValueError(('Variable loading rules did not match any vars. '
+                      'All known: %r') % [v.name for v in all_vars])
   load_var_names = sorted([v.name for _, v in vars_to_load])
   tf.logging.info('Overriding vars from checkpoint: %r', load_var_names)
 
@@ -1150,13 +1396,13 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
     session: Tensorflow session.
     all_vars: List of all the parameters in the model.
     ckpts_loading_rules: A dictionary of checkpoint path: loading rules.
-      Checkpoint path must be a path to a pretrained model, and loading rules
-        is expected to be a tuple of two lists: the first consisting of tuples
-          of strings defining (regex to match parameter names in the model to
-          override, format string to determine the corresponding var in the
-          checkpoint), and the second list consisting of a list of regexes to
-          match parameter names in the model which should not be overridden,
-          even if they match those in the loading rules.
+      Checkpoint path must be a path to a pretrained model, and loading rules is
+      expected to be a tuple of two lists. The first consisting of tuples of
+      strings defining (regex to match parameter names in the model to override,
+      format string to determine the corresponding var in the checkpoint), and
+      the second list consisting of a list of regexes to match parameter names
+      in the model which should not be overridden, even if they match those in
+      the loading rules.
 
   Raises:
     ValueError: if colliding vars exist or loading rules is not a list.
@@ -1169,12 +1415,12 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
     tf.logging.info('Overriding vars from checkpoint: %s', ckpt_path)
 
     if not isinstance(loading_rules, tuple):
-      raise ValueError(
-          'Loading rules for %s must be a tuple of two lists!' % ckpt_path)
+      raise ValueError('Loading rules for %s must be a tuple of two lists!' %
+                       ckpt_path)
     if len(loading_rules) != 2 or not all(
         isinstance(l, list) for l in loading_rules):
-      raise ValueError(
-          'Loading rules for %s must be a tuple of two lists!' % ckpt_path)
+      raise ValueError('Loading rules for %s must be a tuple of two lists!' %
+                       ckpt_path)
 
     # Filter the model variables to be overridden.
     vars_to_override = [
@@ -1192,15 +1438,39 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
   tf.logging.info('Model variables overridden: %s', vars_overridden)
 
 
-def _ComputeGradientsSimple(loss, all_vars):
+def _ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,
+                            colocate_gradients_with_ops, gate_gradients):
   return tf.gradients(
       loss,
       all_vars,
-      aggregation_method=1,  # Tree
-      colocate_gradients_with_ops=True)
+      aggregation_method=grad_aggregation_method,
+      colocate_gradients_with_ops=colocate_gradients_with_ops,
+      gate_gradients=gate_gradients)
 
 
-def _ComputeGradientsTpu(loss, all_vars):
+def ComputeTpuEmbeddingGradients(loss, activation_dict, tpu_embedding):
+  """Returns a TpuEmbedding SendGradient op.
+
+  Args:
+   loss: The loss to backprop from.
+   activation_dict: String feature -> embedding activations dict.
+   tpu_embedding: TPUEmbedding instance.
+  """
+
+  # Scale the loss to account for the full batch size.
+  shards = tpu_function.get_tpu_context().number_of_shards
+  loss *= tf.constant(1.0 / shards, dtype=loss.dtype)
+
+  grads = tf.gradients(loss, activation_dict.values())
+  feature_to_gradient_dict = py_collections.OrderedDict(
+      zip(activation_dict.keys(), grads))
+  send_gradient_op = tpu_embedding.generate_send_gradients_op(
+      feature_to_gradient_dict)
+  return send_gradient_op
+
+
+def _ComputeGradientsTpu(loss, all_vars, grad_aggregation_method,
+                         colocate_gradients_with_ops, gate_gradients):
   """Computes gradients for local loss across whole TPU cluster."""
   # Scale the loss to account for the full batch size.
   shards = tpu_function.get_tpu_context().number_of_shards
@@ -1209,7 +1479,9 @@ def _ComputeGradientsTpu(loss, all_vars):
 
   # Computes the gradients.
   # Sum the grads so that we can compute statistics across the whole batch.
-  all_grads = _ComputeGradientsSimple(loss, all_vars)
+  all_grads = _ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,
+                                      colocate_gradients_with_ops,
+                                      gate_gradients)
 
   # NOTE: We can't use tpu_optimizer.CrossShardOptimizer since
   # we need to scale the grads *after* the cross_replica_sum to
@@ -1222,20 +1494,88 @@ def _ComputeGradientsTpu(loss, all_vars):
   for g in all_grads:
     if g is not None:
       with tf.colocate_with(g):
-        aggregated_grads.append(tf.contrib.tpu.cross_replica_sum(g))
+        aggregated_grads.append(tf.compat.v1.tpu.cross_replica_sum(g))
     else:
       aggregated_grads.append(None)
   return aggregated_grads
 
 
-def ComputeGradients(loss, vmap):
-  """Computes gradients of variables in vmap w.r.t.
+def _ComputeGradientsTpuNas(loss, all_vars, grad_aggregation_method,
+                            colocate_gradients_with_ops, gate_gradients):
+  """Computes gradients for local loss across whole TPU cluster.
 
-  to loss.
+  This implementation specializes for the case where weight params maybe used
+  for different number of times in the forward computation, so that gradients
+  should be normalized by the actual number of times they are being computed.
+
+  TODO(yonghui): Maybe merge this implementation with the _ComputeGradientsTpu
+  one.
+
+  Args:
+    loss: The loss to backprop from.
+    all_vars: Vars with respect to which gradients are to be computed.
+    grad_aggregation_method: aggregation method to use when calling
+      tf.gradients.
+    colocate_gradients_with_ops: boolean, whether or not to colocate gradient op
+      with the original op.
+    gate_gradients: boolean, flag to be passed to tf.gradients.
+
+  Returns:
+    gradients to be passed back.
+  """
+  # Computes the gradients.
+  # Sum the grads so that we can compute statistics across the whole batch.
+  all_grads = _ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,
+                                      colocate_gradients_with_ops,
+                                      gate_gradients)
+
+  # NOTE: We can't use tpu_optimizer.CrossShardOptimizer since
+  # we need to scale the grads *after* the cross_replica_sum to
+  # match GPU version!
+
+  # TODO(cwhipkey): should we do something different here? - we could do
+  # some operations on the gradients before the aggregation (see comments in
+  # tensorflow/contrib/tpu/python/tpu/tpu_optimizer.py - see compute_gradients -
+  # for some more details).
+
+  aggregated_grads = []
+  for g in all_grads:
+    if g is not None:
+      with tf.colocate_with(g):
+        # Q(yonghui): Is there a better way to detect a non-zero gradient?
+        # Note(yonghui): gradient of a weight param can be all zero if that
+        # weight param is not used in the forward computation, e.g. as in
+        # switchable layers in neural architecture search.
+        zero_threashold = 1e-8
+        g_is_non_zero = tf.cast(
+            tf.reduce_sum(tf.math.abs(g)) > zero_threashold, g.dtype)
+        num_updates = tf.maximum(
+            tf.compat.v1.tpu.cross_replica_sum(g_is_non_zero), 1.0)
+        normalized_g = tf.compat.v1.tpu.cross_replica_sum(g) / num_updates
+        aggregated_grads.append(normalized_g)
+    else:
+      aggregated_grads.append(None)
+  return aggregated_grads
+
+
+def ComputeGradients(
+    loss,
+    vmap,
+    grad_aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE,
+    colocate_gradients_with_ops=True,
+    gate_gradients=False):
+  """Computes gradients of variables in vmap w.r.t loss.
 
   Args:
     loss: A scalar Tensor.
     vmap: A `.NestedMap` of variables.
+    grad_aggregation_method: Specifies the method used to combine gradient
+      terms. Accepted values are constants defined in the class
+      AggregationMethod.
+    colocate_gradients_with_ops: If True, try colocating gradients with the
+      corresponding op.
+    gate_gradients: If True, add a tuple around the gradients returned for an
+      operations. This avoids some race conditions.
 
   Returns:
     var_grad - a `.NestedMap` of (variable, gradient). You can view
@@ -1271,8 +1611,16 @@ def ComputeGradients(loss, vmap):
   filtered_vlist = filtered_vmap.Flatten()
 
   # tpu vs non-tpu is slightly different.
-  take_grad = _ComputeGradientsTpu if use_tpu() else _ComputeGradientsSimple
-  grads = take_grad(loss, filtered_vlist)
+  if use_tpu():
+    if nas_run():
+      take_grad = _ComputeGradientsTpuNas
+    else:
+      take_grad = _ComputeGradientsTpu
+  else:
+    take_grad = _ComputeGradientsSimple
+
+  grads = take_grad(loss, filtered_vlist, grad_aggregation_method,
+                    colocate_gradients_with_ops, gate_gradients)
 
   # Formulate pairs of (var, grad) and pack them into the same
   # structure as filtered_vmap.
@@ -1285,29 +1633,24 @@ def ComputeGradients(loss, vmap):
   return var_grad.Filter(lambda v_g: v_g[1] is not None)
 
 
-def MaskGradients(var_grad, grad_mask, grad_onehot):
-  """Computes gradients of variables in vmap w.r.t.
-
-  loss.
+def MaskGradients(var_grad, grad_mask):
+  """Computes gradients of non-masked variables in vmap w.r.t loss.
 
   Args:
     var_grad: A `.NestedMap` of (variable, gradient)
-    grad_mask: A `.NestedMap` of (variable, mask).
-    grad_onehot: A 1-hot vector of the current data source selected.
+    grad_mask: A dict of (variable name, mask).
 
   Returns:
-    var_grad - a `.NestedMap` of (variable, mask *  gradient).
+    var_grad - a `.NestedMap` of (variable, mask * gradient).
   """
 
   def ApplyMask(entry):
     var, grad = entry
-    grad_mask_dotproduct = tf.tensordot(grad_onehot, grad_mask[var.name], 1)
+    mask = grad_mask[var.name]
     if isinstance(grad, tf.IndexedSlices):
-      return (var,
-              tf.IndexedSlices(grad.values * grad_mask_dotproduct,
-                               grad.indices))
+      return (var, tf.IndexedSlices(grad.values * mask, grad.indices))
     else:
-      return (var, grad * grad_mask_dotproduct)
+      return (var, grad * mask)
 
   return var_grad.Transform(ApplyMask)
 
@@ -1327,8 +1670,8 @@ def ApplyGradMultiplier(vs_gs_scale, grad_scale=None):
   """
 
   if grad_scale is not None:
-    vs_gs_scale = vs_gs_scale.Transform(
-        lambda v_g: (v_g[0], v_g[1], grad_scale))
+    vs_gs_scale = vs_gs_scale.Transform(lambda v_g: (v_g[0], v_g[1], grad_scale)
+                                       )
 
   def ScaleOrZero(var, grad, scale):
     grad = CheckNumerics(grad, 'Gradient for %s is not finite.' % var.name)
@@ -1350,6 +1693,61 @@ def ApplyGradMultiplier(vs_gs_scale, grad_scale=None):
     return (var, grad)
 
   return vs_gs_scale.Transform(Scale)
+
+
+def HasNanOrInfGradient(var_grads):
+  """Returns a bool tensor to indicate if `var_grads` contains NaNs or Infs.
+
+  Args:
+    var_grads: A `.NestedMap` with (var, grad) tuple as the map value.
+
+  Returns:
+    A bool scalar tensor to indicate if the `var_grads` contains NaNs or Infs.
+  """
+
+  def HasNanOrInf(x):
+    if isinstance(x, tf.IndexedSlices):
+      x = x.values
+    with tf.device(x.device):
+      if x.dtype.is_complex:
+        return tf.reduce_any([HasNanOrInf(tf.real(x)), HasNanOrInf(tf.imag(x))])
+      return tf.reduce_any(tf.logical_or(tf.is_nan(x), tf.is_inf(x)))
+
+  return tf.reduce_any([HasNanOrInf(g) for (_, g) in var_grads.Flatten()])
+
+
+def ApplyGradNormCliping(vs_gs, norm=1.0):
+  """Clip gradients to norm on same device as corresponding variables.
+
+  Args:
+    vs_gs: A `.NestedMap` of (variable, gradient).
+    norm: Each tensor's gradient will be scaled down to have a maximum L2-norm
+      value of `norm`.
+
+  Returns:
+    A `.NestedMap` of (variable, scaled_gradient). In particular, if
+    grad_scale is 0, the result gradient is always 0, even if the input
+    gradient is inf or nan.
+  """
+  vs_gs_norm = vs_gs.Transform(lambda v_g: (v_g[0], v_g[1], norm))
+
+  def ClipByNorm(var, grad, norm):
+    grad = CheckNumerics(grad, 'Gradient for %s is not finite.' % var.name)
+    return tf.clip_by_norm(grad, norm)
+
+  def Clip(item):
+    """Scales the gradient."""
+    var, grad, norm = item
+    assert grad is not None, ('No grad found for ', var.name)
+    with tf.device(var.device):
+      if isinstance(grad, tf.IndexedSlices):
+        grad = tf.IndexedSlices(
+            ClipByNorm(var, grad.values, norm), grad.indices, grad.dense_shape)
+      else:
+        grad = ClipByNorm(var, grad, norm)
+    return (var, grad)
+
+  return vs_gs_norm.Transform(Clip)
 
 
 SKIP_LP_REGULARIZATION = '__lingvo_skip_lp_regularization'
@@ -1384,16 +1782,19 @@ def AdjustGradientsWithLpLoss(var_grads, lp_regularizer_weight, p=2.0):
     else:
       return var
 
+  def Skip(v_g):
+    return v_g[0] not in tf.get_collection(SKIP_LP_REGULARIZATION)
+
+  filtered_var_grads = var_grads.Filter(Skip)
+  for k, (v, _) in filtered_var_grads.FlattenItems():
+    tf.logging.info('AdjustGradientsWithLpLoss: %s: %s', k, v)
+
   if p == 2.0:
     lp_loss = 0.5 * lp_regularizer_weight * SumSquared(
-        var_grads.Filter(
-            lambda v_g: v_g[0] not in tf.get_collection(SKIP_LP_REGULARIZATION))
-        .Transform(GetVar).Flatten())
+        filtered_var_grads.Transform(GetVar).Flatten())
   elif p == 1.0:
     lp_loss = lp_regularizer_weight * SumAbs(
-        var_grads.Filter(
-            lambda v_g: v_g[0] not in tf.get_collection(SKIP_LP_REGULARIZATION))
-        .Transform(GetVar).Flatten())
+        filtered_var_grads.Transform(GetVar).Flatten())
 
   def LpGrad(item):
     """Adjusts item's grad w/ Lp loss term."""
@@ -1543,13 +1944,14 @@ def AddToPruningCollections(weight, mask, threshold):
     tf.add_to_collection(pruning_layers.THRESHOLD_COLLECTION, threshold)
 
 
-def WeightedAvg(values, weights, sum_reduction_fn=tf.reduce_sum):
+def WeightedAvg(values, weights, sum_reduction_fn=tf.reduce_sum, name=''):
   """Computes weighted average of values from a tensor.
 
   Args:
     values: a tensor of values
     weights: a tensor of weights
-    sum_reduction_fn: called to reduce the values and weights to single value.
+    sum_reduction_fn: called to reduce the values and weights to single value
+    name: name of metric.
 
   Returns:
     A tuple (avg, total_weight).
@@ -1557,12 +1959,9 @@ def WeightedAvg(values, weights, sum_reduction_fn=tf.reduce_sum):
     - avg: weighted average value
     - total_weight: sum of all weights
   """
-  values = with_dependencies([
-      assert_equal(
-          tf.shape(values),
-          tf.shape(weights),
-          message='shape of values and weights tensors must match.')
-  ], values)
+  msg = 'shape of values and weights tensors must match for metric ' + name
+  values = with_dependencies(
+      [assert_equal(tf.shape(values), tf.shape(weights), message=msg)], values)
   total_weight = sum_reduction_fn(weights)
   avg = sum_reduction_fn(values * tf.cast(weights, values.dtype)) / tf.cast(
       total_weight, values.dtype)
@@ -1589,7 +1988,30 @@ def WeightedAvgOfMetrics(metrics):
   for name, values_and_weights in sorted(six.iteritems(lists_of_metrics)):
     values = tf.stack([x[0] for x in values_and_weights])
     weights = tf.stack([x[1] for x in values_and_weights])
-    ret_dict[name] = WeightedAvg(values, weights, tf.reduce_sum)
+    ret_dict[name] = WeightedAvg(values, weights, tf.reduce_sum, name)
+
+  return ret_dict
+
+
+def ConcatPerExampleTensors(per_example):
+  """Concatenate per-example tensors from many hosts into one large block.
+
+  Args:
+    per_example: list of dictionaries of per-example tensors.
+
+  Returns:
+    ret_dict - string -> concatenated tensors.
+  """
+  ret_dict = {}
+  lists_of_per_example = {}
+  for m in per_example:
+    for name, value in six.iteritems(m):
+      if name not in lists_of_per_example:
+        lists_of_per_example[name] = []
+      lists_of_per_example[name].append(value)
+
+  for name, values in sorted(six.iteritems(lists_of_per_example)):
+    ret_dict[name] = tf.concat(values, 0)
 
   return ret_dict
 
@@ -1687,61 +2109,92 @@ def VariationalNoiseParams(scale, global_vn=False, per_step_vn=False,
   return p
 
 
-def GetStepSeed(graph=None):
+def GetStepSeed():
   """Gets step_seed."""
-  graph = graph or tf.get_default_graph()
-  step_seed_tensors = graph.get_collection_ref('step_seed')
-  if len(step_seed_tensors) == 1:
+  step_seed_tensors = tf.get_default_graph().get_collection_ref('step_seed')
+  if not step_seed_tensors:
+    ResetStepSeed()
+    return GetStepSeed()
+  elif len(step_seed_tensors) == 1:
     return step_seed_tensors[0]
-  return None
-
-
-def ResetStepSeed(graph=None, seed=0):
-  """Resets step_seed to specified value."""
-  graph = graph or tf.get_default_graph()
-  step_seed_tensors = graph.get_collection_ref('step_seed')
-  if len(step_seed_tensors) == 1:
-    step_seed_tensors[0] = tf.convert_to_tensor(seed, dtype=tf.int64)
-  elif not step_seed_tensors:
-    tf.add_to_collection('step_seed', tf.convert_to_tensor(
-        seed, dtype=tf.int64))
   else:
     raise ValueError('Multiple tensors in step_seed collection.')
 
 
-def GetIncStepSeed(graph=None):
+def ResetStepSeed(seed=0):
+  """Resets step_seed to specified value."""
+  new_step_seed = tf.convert_to_tensor(seed, dtype=tf.int64)
+  step_seed_tensors = tf.get_default_graph().get_collection_ref('step_seed')
+  if len(step_seed_tensors) == 1:
+    step_seed_tensors[0] = new_step_seed
+  elif not step_seed_tensors:
+    tf.add_to_collection('step_seed', new_step_seed)
+  else:
+    raise ValueError('Multiple tensors in step_seed collection.')
+
+
+def GetIncStepSeed():
   """Returns and increments the step_seed."""
-  graph = graph or tf.get_default_graph()
-  step_seed_tensors = graph.get_collection_ref('step_seed')
-  assert len(step_seed_tensors) == 1, str(step_seed_tensors)
-  step_seed = step_seed_tensors[0]
+  step_seed = GetStepSeed()
   # TODO(lepikhin): introduce a routine filling a queue of uint32 random seeds
   # independent of underlying PRNG used by tensorflow.
-  step_seed_tensors[0] = step_seed_tensors[0] + 1
+  ResetStepSeed(step_seed + 1)
   return step_seed
 
 
-def GetOpSeedPair(op_seed=None, graph=None):
-  """Returns the seed pair for an operation given op_seed."""
-  graph = graph or tf.get_default_graph()
-  step_seed = GetIncStepSeed(graph)
-  global_step = tf.train.get_global_step(graph)
-  seeds = tf.stack([global_step, tf.cast(step_seed, global_step.dtype)])
+def GenerateStepSeedPair(p, global_step, op_seed=None):
+  """Generates a seed pair for deterministic random operations in functional loops.
 
+  This function retrieves a unique seed pair on each call, based off the current
+  global step and step seed. The step seed ensures this function returns a
+  unique seed pair on each call: calling this function automatically increments
+  the step seed. The step seed is automatically reset at the beginning of each
+  global step in the model's FProp and works transparently through recurrent.py.
+
+  Args:
+    p: A hyperparams.Params object, containing keys 'random_seed' and
+      'is_inference'.
+    global_step: The global step.
+    op_seed: An additional operation-level seed to apply.
+
+  Returns:
+    A size 2 tensor of op seeds to use for stateless_random ops.
+  """
+  seed_dtype = tf.int32 if use_tpu() else tf.int64
+  if p.is_inference and p.random_seed is None:
+    # Ensure GetIncStepSeed is called even inside the shortcut.
+    # This ensures if p.random_seed is set for other ops that use this function
+    # that they will get the same seed pair whether or not p.random_seed is set
+    # for this specific call.
+    GetIncStepSeed()
+    # Unlike tf.random*, stateless random ops are completely determined by the
+    # passed-in seeds. This means at inference time the same inputs will produce
+    # the same outputs, even if the model is supposed to have randomness such as
+    # dropout during inference. We inject additional randomness only during
+    # inference if the graph is exported with random_seed=None as a workaround.
+    return tf.random_uniform([2], maxval=seed_dtype.max, dtype=seed_dtype)
+
+  global_step = tf.cast(global_step, seed_dtype)
+  step_seed = tf.cast(GetIncStepSeed(), seed_dtype)
+  seeds = tf.stack([global_step, step_seed])
+
+  if p.random_seed is not None:
+    seeds += p.random_seed
   if op_seed is not None:
     seeds += op_seed
-
   return seeds
 
 
-def DeterministicDropout(x, keep_prob, seeds, name=None):
+def DeterministicDropout(x, keep_prob, seeds, noise_shape=None, name=None):
   """Similar to `tf.nn.dropout()`, but fully deterministic.
 
   Args:
     x: A float Tensor on which to apply dropout.
-    keep_prob: A scalar of keep probability.
+    keep_prob: A scalar `Tensor` of keep probability.
     seeds: A Tensor of shape [2]. 2 seeds for deterministic random number
       generator.
+    noise_shape: A 1-D `Tensor` of type `int32`, representing the shape for
+      randomly generated keep/drop flags.
     name: An optional name for this operation.
 
   Returns:
@@ -1750,12 +2203,13 @@ def DeterministicDropout(x, keep_prob, seeds, name=None):
   Raises:
     InvalidArgumentError: if keep_prob is invalid.
   """
-  if keep_prob <= 0 or keep_prob > 1:
-    raise tf.errors.InvalidArgumentError(
-        'keep_prob must be in range (0, 1]. Value: {}'.format(keep_prob))
+  if isinstance(keep_prob, numbers.Real):
+    if keep_prob <= 0 or keep_prob > 1:
+      raise tf.errors.InvalidArgumentError(
+          'keep_prob must be in range (0, 1]. Value: {}'.format(keep_prob))
 
-  if keep_prob == 1:
-    return x
+    if keep_prob == 1:
+      return x
   with tf.name_scope(name, 'dropout', [x]) as name:
     if use_tpu():
       seeds = tf.cast(seeds, tf.int32)
@@ -1764,8 +2218,9 @@ def DeterministicDropout(x, keep_prob, seeds, name=None):
     # uniform in [keep_prob, 1.0 + keep_prob)
     # StatelessRandomUniform op does not support non-float (e.g. bfloat16) dtype
     # and non-int32 seed types.
-    random_tensor = keep_prob + tf.contrib.stateless.stateless_random_uniform(
-        GetShape(x), seed=seeds, dtype=tf.float32)
+    noise_shape = noise_shape or GetShape(x)
+    random_tensor = keep_prob + tf.random.stateless_uniform(
+        noise_shape, seed=seeds, dtype=tf.float32)
     # 0. if [keep_prob, 1.0) and 1. if [1.0, 1.0 + keep_prob)
     binary_tensor = tf.floor(random_tensor)
     if x.dtype != tf.float32:
@@ -1779,8 +2234,8 @@ def DeterministicDropout(x, keep_prob, seeds, name=None):
 BATCH_NORM_UPDATES = 'batch_norm_updates'
 
 _BATCH_NORM_UPDATES_DICT = '__batch_norm_update_dict'
-_get_batch_norm_updates_dict = _CollectionGetter(_BATCH_NORM_UPDATES_DICT,
-                                                 lambda: {})
+_get_batch_norm_updates_dict = _CollectionGetter(
+    _BATCH_NORM_UPDATES_DICT, lambda: {})
 
 
 def UpdateBatchNormVars(batch_norm_var, batch_norm_stats, decay):
@@ -1807,7 +2262,7 @@ def FindRelevantBatchNormUpdates(loss, batch_norm_updates):
   """Finds and returns a list of relevant batch-normalization updates.
 
   Args:
-    loss: The loss that is being optimized for.
+    loss: The loss that is being optimized for. A tensor or a list of tensors.
     batch_norm_updates: A list of batch normalization updates.
 
   Returns:
@@ -1815,7 +2270,7 @@ def FindRelevantBatchNormUpdates(loss, batch_norm_updates):
     that are relevant to the loss being optimized, and the second list contains
     all in batch_norm_updates but not in the first list.
   """
-  dependent_ops_and_tensors = set(FindNeeded([loss]))
+  dependent_ops_and_tensors = set(FindNeeded(loss))
   relevant_updates = []
   irrelevant_updates = []
 
@@ -1837,8 +2292,8 @@ def FindRelevantBatchNormUpdates(loss, batch_norm_updates):
 
 
 _MODEL_SPLIT_ID_STACK = '__model_split_id_stack'
-_get_model_split_id_stack = _CollectionGetter(_MODEL_SPLIT_ID_STACK,
-                                              lambda: [0])
+_get_model_split_id_stack = _CollectionGetter(
+    _MODEL_SPLIT_ID_STACK, lambda: [0])
 
 
 def GetModelSplit():
@@ -2018,7 +2473,7 @@ def PadSequenceDimension(x, length, pad_val, shape=None):
     pad_len = length - slen
     pad = tf.scatter_nd([[1, 1]], [pad_len], [rank, 2])
   x = tf.pad(x, pad, constant_values=pad_val)
-  if x.shape.ndims is not None:
+  if x.shape.ndims is not None and isinstance(length, int):
     static_shape = x.shape.as_list()
     static_shape[1] = length
     x.set_shape(static_shape)
@@ -2031,7 +2486,7 @@ def PadSequenceDimension(x, length, pad_val, shape=None):
   return x
 
 
-def ApplyPadding(padding, x, padded=None, broadcast=True):
+def ApplyPadding(padding, x, padded=None, broadcast=True, use_select=True):
   """Applies padding to a tensor.
 
   This is preferable to using arithmetic means for masking out padded values
@@ -2058,6 +2513,10 @@ def ApplyPadding(padding, x, padded=None, broadcast=True):
     broadcast: Whether to broadcast the padding shape to the shape of 'x'. You
       almost certainly want this to be true as it matches how padding would be
       expanded if applied arithmetically.
+    use_select: Controls whether padding is applied with a select-mask
+      (True/default) or arithmetically (False). Some platforms have a
+      sensitivity to one or the other and this is used to work around such
+      issues.
 
   Returns:
     A tensor with the same shape as x with padded values masked.
@@ -2068,11 +2527,45 @@ def ApplyPadding(padding, x, padded=None, broadcast=True):
               tf.logical_or(tf.equal(padding, 0.0), tf.equal(padding, 1.0))),
           [padding])
   ], padding)
-  if padded is None:
-    padded = tf.zeros_like(x)
-  if broadcast:
-    padding *= tf.ones_like(x)  # Broadcast padding to the full shape.
-  return tf.where(padding > 0.0, padded, x)
+  if use_select:
+    if padded is None:
+      padded = tf.zeros_like(x)
+    if broadcast:
+      padding *= tf.ones_like(x)  # Broadcast padding to the full shape.
+    return tf.where(padding > 0.0, padded, x)
+  else:
+    if padded is None:
+      return x * (1.0 - padding)
+    else:
+      return x * (1.0 - padding) + padded * padding
+
+
+def TrimTrailingPaddings(inputs, paddings):
+  """Trims trailing paddings from inputs.
+
+  Since the number of dimensions is not fixed, this will not work on TPU.
+
+  Args:
+    inputs: a tensor with shape [batch, length, ...].
+    paddings: a tensor with shape [batch, length].
+
+  Returns:
+    Trimmed inputs and paddings. For compatibility reasons, the trimmed tensors
+    will always have length at least 1.
+  """
+  paddings = HasRank(paddings, 2)
+  # Find the last unpadded value. Argmax returns the first index when tied.
+  # Cannot just use tf.reduce_sum because there might be leading paddings.
+  cumsum = tf.cumsum(1.0 - paddings, axis=1)
+  length = tf.argmax(cumsum, axis=1, output_type=tf.int32) + 1
+  max_length = tf.reduce_max(length)
+  output_shape = tf.shape(inputs)
+  output_shape = tf.concat([[output_shape[0], max_length], output_shape[2:]],
+                           axis=0)
+  outputs = tf.slice(inputs, tf.zeros_like(output_shape), output_shape)
+  out_paddings = tf.slice(paddings, [0, 0],
+                          tf.stack([output_shape[0], max_length]))
+  return outputs, out_paddings
 
 
 def ReversePaddedSequence(inputs, paddings):
@@ -2095,8 +2588,8 @@ def ReversePaddedSequence(inputs, paddings):
   return tf.reverse_sequence(inputs, inputs_length, seq_axis=0, batch_axis=1)
 
 
-def Retry(max_retries=None, retry_value=Exception):
-  return retry.Retry(max_retries, retry_value)
+def Retry(*args, **kwargs):
+  return retry.Retry(*args, **kwargs)
 
 
 # FailedPreconditionError: variables are not initialized.
@@ -2106,26 +2599,35 @@ transient_tf_errors = (tf.errors.FailedPreconditionError,
                        tf.errors.AbortedError, tf.errors.UnavailableError)
 
 
-def RetryOnTransientTfError(max_retries=None):
-  return Retry(max_retries=max_retries, retry_value=transient_tf_errors)
+def RetryOnTransientTfError(*args, **kwargs):
+  return Retry(transient_tf_errors, *args, **kwargs)
 
 
-def PadOrTrimTo(x, shape):
+def PadOrTrimTo(x, shape, pad_val=0):
   """Pad and slice x to the given shape.
 
   Args:
     x: A tensor.
     shape: The shape of the returned tensor.
+    pad_val: An int or float used to pad x.
 
   Returns:
-    'x' is padded with zeros and sliced so that the result has the given shape.
+    'x' is padded with pad_val and sliced so that the result has the given
+    shape.
   """
-  x = HasRank(x, len(shape))
+  if isinstance(shape, (list, tuple)):
+    expected_rank = len(shape)
+  elif isinstance(shape, tf.TensorShape):
+    expected_rank = shape.rank
+  else:
+    shape = HasRank(shape, 1)
+    expected_rank = tf.size(shape)
+  x = HasRank(x, expected_rank)
   # If dim-i is less than shape[i], pads on the right shape[i] -
   # dim-i.  Otherwise, pads [0, 0] for dim-i.
   pad = shape - tf.minimum(tf.shape(x), shape)
   zeros = tf.zeros_like(pad)
-  x = tf.pad(x, tf.stack([zeros, pad], axis=1))
+  x = tf.pad(x, tf.stack([zeros, pad], axis=1), constant_values=pad_val)
   # If dim-i is larger than shape[i], we slice [0:shape[i]] for dim-i.
   return tf.reshape(tf.slice(x, zeros, shape), shape)
 
@@ -2133,9 +2635,9 @@ def PadOrTrimTo(x, shape):
 def RepeatDim(tensor, multiple, axis):
   """Copies elements in tensor's axis "multiple" times, like np.repeat."""
   # x = [[1, 2, 3], [4, 5, 6]]
-  # RepeatDim(x, 1) gives:
+  # RepeatDim(x, multiple=2, axis=1) gives:
   # [[1, 1, 2, 2, 3, 3]. [4, 4, 5, 5, 6, 6]]
-  # As a comparison tf.tile(x, 1) gives:\
+  # As a comparison tf.tile(x, multiples=[1, 2]) gives:\
   # [[1, 2, 3, 1, 2, 3], [4, 5, 6, 4, 5, 6]]
 
   if multiple == 1:
@@ -2208,11 +2710,10 @@ def MixByWeight(inputs, weights):
 
 
 def CheckShapes(shapes):
-  """Asserts that shapes is a tuple of fully defined tf.TensorShape."""
+  """Asserts that shapes is a tuple of tshape.Shape."""
   assert isinstance(shapes, tuple), str(shapes)
   for s in shapes:
-    assert isinstance(s, tf.TensorShape), str(s)
-    assert s.is_fully_defined()
+    assert isinstance(s, tshape.Shape), '{}: {}'.format(type(s), s)
 
 
 def FPropDtype(params):
@@ -2262,3 +2763,192 @@ def NameScopeDecorator(name_scope):
     return Wrapped
 
   return Decorator
+
+
+def SequencesToDebugStrings(ids, lens, summarize=5):
+  """Returns debug strings for the given sequences.
+
+  Args:
+    ids: int32 of [batch, len].
+    lens: int32 of [batch].
+    summarize: number of ids to summarize per sequence.
+
+  Returns:
+    A string tensor of [batch].
+  """
+  num_seqs = tf.shape(lens)[0]
+
+  def _Body(i, result):
+    line = tf.strings.format('{}', ids[i, :lens[i]], summarize=summarize)
+    return i + 1, tf.concat([result, tf.reshape(line, [1])], axis=0)
+
+  i0 = tf.zeros(shape=[], dtype=tf.int32)
+  result0 = tf.constant('', shape=[0], dtype=tf.string)
+  _, strs = tf.while_loop(
+      lambda i, result: i < num_seqs,
+      _Body, (i0, result0),
+      shape_invariants=(i0.shape, tf.TensorShape([None])))
+  return strs
+
+
+def RematerializeFn(fn, *xs):
+  """Calls fn and rematerializes fn in the backward pass.
+
+  `fn(*xs) -> ys`, where xs and ys can be a single tensor or a tuple of tensors.
+
+  Args:
+    fn: A python function to be rematerialized in the backprop pass.
+    *xs: A single tensor or a list/tuple of tensors. `xs` are input args to the
+      fn function.
+
+  Returns:
+    `fn(*xs)`
+  """
+  initial_step_seed = GetStepSeed()
+  final_step_seed = zlib.adler32(tf.no_op(name='new_step_seed').name.encode())
+
+  def Backward(op, *dy):
+    """The backward function that rematerializes forward outputs."""
+    always_true = tf.random.uniform([]) < 2.0
+    # Alternatively, can do this:
+    # tf.where(tf.is_nan(x),
+    #          tf.constant(float('nan'), dtype=x.dtype) * tf.ones_like(x),
+    #          x)
+    # Skip op.inputs[0] which is initial_step_seed.
+    bak_xs = [tf.where(always_true, x, tf.zeros_like(x)) for x in op.inputs[1:]]
+    for dst, src in zip(bak_xs, xs):
+      dst.set_shape(src.shape)
+    ResetStepSeed(initial_step_seed)
+    ys = fn(*bak_xs)
+    ResetStepSeed(final_step_seed)
+    dxs = tf.gradients(ys, bak_xs, grad_ys=dy)
+    dxs_final = []
+    for dx, x in zip(dxs, bak_xs):
+      if dx is None:
+        dxs_final.append(tf.zeros_like(x))
+      else:
+        dxs_final.append(dx)
+    assert len(dxs_final) == len(bak_xs)
+    return (tf.zeros_like(initial_step_seed),) + tuple(dxs_final)
+
+  xs_dtypes = [x.dtype for x in xs]
+  ys_shapes = []
+
+  # TODO(huangyp, yonghui): Check Forward doesn't use any stateful random ops.
+  @function.Defun(
+      initial_step_seed.dtype, *xs_dtypes, python_grad_func=Backward)
+  def Forward(initial_step_seed, *fwd_xs):
+    """Forward function plus sanity checks."""
+    for dst, src in zip(fwd_xs, xs):
+      dst.set_shape(src.shape)
+    ResetStepSeed(initial_step_seed)
+    ys = fn(*fwd_xs)
+    # Some sanity check.
+    assert not function.get_extra_inputs()
+    assert not function.get_extra_args()
+    assert not function.get_extra_vars()
+    if isinstance(ys, tuple):
+      for y in ys:
+        assert isinstance(y, tf.Tensor)
+        ys_shapes.append(y.shape)
+    else:
+      assert isinstance(ys, tf.Tensor)
+      ys_shapes.append(ys.shape)
+    return ys
+
+  ys = Forward(initial_step_seed, *xs)
+  if isinstance(ys, tuple):
+    for y, s in zip(ys, ys_shapes):
+      y.set_shape(s)
+  else:
+    ys.set_shape(ys_shapes[0])
+  # TODO(b/129159299): The ResetStepSeed below is needed to work around this
+  # bug, which is a problem with global tensors being shared by different
+  # inference graphs. It should be replaced with the new step seed value
+  # returned from the Forward function when the bug is fixed.
+  ResetStepSeed(final_step_seed)
+  return ys
+
+
+# A set of names of stateful random number generator ops.
+# See tensorflow/core/ops/random_ops.cc
+_STATEFUL_RANDOM_OPS = {
+    # pyformat: disable
+    'RandomUniform',
+    'RandomUniformInt',
+    'RandomStandardNormal',
+    'ParameterizedTruncatedNormal',
+    'TruncatedNormal',
+    'RandomShuffle',
+    'Multinomial',
+    'RandomGamma',
+    'RandomPoisson',
+    'RandomPoissonV2',
+    # pyformat: enable
+}
+
+
+def StatefulRandomOpsInDefun(func, graph=None):
+  """Checks whether the Defun depends on stateful random number ops.
+
+  Stateful random number generator ops should be avoid in Recurrent() call.
+  Otherwise, these ops produce inconsistent values between FProp and BProp.
+
+  Args:
+    func: a _DefinedFunction to check.
+    graph: a Graph. Set None to use the default graph.
+
+  Returns:
+    A list of names of the stateful random ops.
+
+  Raises:
+    InvalidArgumentError: if the input func/graph is invalid.
+  """
+  if not isinstance(func, function._DefinedFunction):  # pylint: disable=protected-access
+    raise tf.errors.InvalidArgumentError(None, None,
+                                         'func is not a _DefinedFunction.')
+
+  if graph is None:
+    graph = tf.get_default_graph()
+  func.add_to_graph(graph)
+  graph_def = graph.as_graph_def()
+
+  # A dict from function name to FunctionDef.
+  func_defs = {x.signature.name: x for x in graph_def.library.function}
+
+  if func.definition.signature.name not in func_defs:
+    raise tf.errors.InvalidArgumentError(
+        None, None,
+        'Defun {} is not in the graph .'.format(func.definition.signature.name))
+
+  stateful_ops = []
+
+  # Recursively search for stateful random op.
+  nodes = py_collections.deque(func.definition.node_def)
+  while nodes:
+    node = nodes.pop()
+    assert isinstance(node, node_def_pb2.NodeDef), node
+
+    if node.op in _STATEFUL_RANDOM_OPS:
+      stateful_ops.append(node.op)
+      continue
+
+    def _AddDefunNodes(func_name):
+      """If the given func_name is a Defun, add its sub-nodes into nodes."""
+      if func_name in func_defs:
+        nodes.extend(func_defs[func_name].node_def)
+
+    # For functional.{While|For|If} ops, add their Defun attr into search.
+    if node.op == 'While':
+      _AddDefunNodes(node.attr['body'].func.name)
+      _AddDefunNodes(node.attr['cond'].func.name)
+    elif node.op == 'For':
+      _AddDefunNodes(node.attr['body'].func.name)
+    elif node.op == 'If':
+      _AddDefunNodes(node.attr['then_branch'].func.name)
+      _AddDefunNodes(node.attr['else_branch'].func.name)
+    else:
+      # For other op, check whether itself is a Defun op.
+      _AddDefunNodes(node.op)
+
+  return stateful_ops

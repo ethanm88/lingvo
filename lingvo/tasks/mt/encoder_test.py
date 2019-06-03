@@ -18,12 +18,12 @@ from __future__ import print_function
 
 import numpy as np
 import tensorflow as tf
-
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 from lingvo.tasks.mt import encoder
 
 
-class EncoderTest(tf.test.TestCase):
+class EncoderTest(test_utils.TestCase):
 
   def _EncoderParams(self):
     p = encoder.MTEncoderV1.Params()
@@ -48,10 +48,10 @@ class EncoderTest(tf.test.TestCase):
       batch = py_utils.NestedMap()
       batch.ids = tf.transpose(tf.reshape(tf.range(0, 8, 1), [4, 2]))
       batch.paddings = tf.zeros([2, 4])
-      enc_out = mt_enc.FPropDefaultTheta(batch)
+      enc_out = mt_enc.FPropDefaultTheta(batch).encoded
 
       tf.global_variables_initializer().run()
-      actual_enc_out = enc_out[0].eval()
+      actual_enc_out = enc_out.eval()
       expected_enc_out = [[[
           -7.51581979e-07, 1.55304758e-06, -3.39117889e-07, 2.79457527e-06
       ], [-1.06733505e-05, 7.56898862e-06, -4.18875834e-06, -9.10360086e-06]], [
@@ -110,11 +110,11 @@ class EncoderTest(tf.test.TestCase):
             [[0, 0, 0, 1, 1, 1, 2, 2, 2]], dtype=tf.float32)
         packed_batch.segment_pos = tf.constant(
             [[0, 1, 2, 0, 1, 2, 0, 1, 2]], dtype=tf.int32)
-        enc_out = mt_enc.FPropDefaultTheta(batch)[0]
+        enc_out = mt_enc.FPropDefaultTheta(batch).encoded
         enc_out = tf.transpose(enc_out, [1, 0, 2])
 
         packed_enc_out = mt_enc_packed.FPropDefaultTheta(packed_batch)
-        packed_enc_out = tf.reshape(packed_enc_out[0], tf.shape(enc_out))
+        packed_enc_out = tf.reshape(packed_enc_out.encoded, tf.shape(enc_out))
 
         tf.global_variables_initializer().run()
         actual_enc_out, actual_packed_enc_out = sess.run(
@@ -134,10 +134,10 @@ class EncoderTest(tf.test.TestCase):
       batch = py_utils.NestedMap()
       batch.ids = tf.transpose(tf.reshape(tf.range(0, 8, 1), [4, 2]))
       batch.paddings = tf.zeros([2, 4])
-      enc_out = mt_enc.FPropDefaultTheta(batch)
+      enc_out = mt_enc.FPropDefaultTheta(batch).encoded
 
       tf.global_variables_initializer().run()
-      actual_enc_out = enc_out[0].eval()
+      actual_enc_out = enc_out.eval()
       expected_enc_out = [[[-1.74790625e-06, -5.04228524e-07], [
           2.04836829e-06, 1.48639378e-06
       ]], [[-1.10486064e-06, -5.77133278e-07],
@@ -156,10 +156,10 @@ class EncoderTest(tf.test.TestCase):
       batch = py_utils.NestedMap()
       batch.ids = tf.transpose(tf.reshape(tf.range(0, 8, 1), [4, 2]))
       batch.paddings = tf.zeros([2, 4])
-      enc_out = mt_enc.FPropDefaultTheta(batch)
+      enc_out = mt_enc.FPropDefaultTheta(batch).encoded
 
       tf.global_variables_initializer().run()
-      actual_enc_out = enc_out[0].eval()
+      actual_enc_out = enc_out.eval()
       expected_enc_out = [[[1.42110639e-06, 1.31101151e-05], [
           -6.62138473e-06, -1.11313329e-06
       ]], [[1.14506956e-05, 2.98347204e-05], [-5.89276988e-06, 5.54328744e-06]],
@@ -178,10 +178,10 @@ class EncoderTest(tf.test.TestCase):
       batch = py_utils.NestedMap()
       batch.ids = tf.transpose(tf.reshape(tf.range(0, 8, 1), [4, 2]))
       batch.paddings = tf.zeros([2, 4])
-      enc_out = mt_enc.FPropDefaultTheta(batch)
+      enc_out = mt_enc.FPropDefaultTheta(batch).encoded
 
       tf.global_variables_initializer().run()
-      actual_enc_out = enc_out[0].eval()
+      actual_enc_out = enc_out.eval()
       print('bi_enc_actual_enc_out_with_dropout', np.array_repr(actual_enc_out))
       # pylint: disable=bad-whitespace,bad-continuation
       # pyformat: disable
@@ -208,10 +208,10 @@ class EncoderTest(tf.test.TestCase):
       batch = py_utils.NestedMap()
       batch.ids = tf.transpose(tf.reshape(tf.range(0, 8, 1), [4, 2]))
       batch.paddings = tf.zeros([2, 4])
-      enc_out = mt_enc.FPropDefaultTheta(batch)
+      enc_out = mt_enc.FPropDefaultTheta(batch).encoded
 
       tf.global_variables_initializer().run()
-      actual_enc_out = enc_out[0].eval()
+      actual_enc_out = enc_out.eval()
       # pylint: disable=bad-whitespace,bad-continuation
       # pyformat: disable
       expected_enc_out = [
@@ -229,7 +229,7 @@ class EncoderTest(tf.test.TestCase):
       self.assertAllClose(expected_enc_out, actual_enc_out)
 
 
-class TransformerEncoderTest(tf.test.TestCase):
+class TransformerEncoderTest(test_utils.TestCase):
 
   def _EncoderParams(self):
     p = encoder.TransformerEncoder.Params()
@@ -268,13 +268,15 @@ class TransformerEncoderTest(tf.test.TestCase):
       batch.ids = tf.constant(
           np.random.randint(low=0, high=63, size=[bs, sl], dtype=np.int32))
       batch.paddings = tf.zeros([bs, sl])
-      enc_out = mt_enc.FPropDefaultTheta(batch)
-      enc_out_sum = tf.reduce_sum(enc_out[0], 0)
-      enc_atten_probs = enc_out[1]
+      out = mt_enc.FPropDefaultTheta(batch)
+      enc_out_sum = tf.reduce_sum(out.encoded, 0)
+      emb_out_sum = tf.reduce_sum(out.embedded_inputs, 0)
+      enc_padding = out.padding
 
       tf.global_variables_initializer().run()
-      actual_enc_out, actual_enc_out_sum, actual_atten_probs = sess.run(
-          [enc_out[0], enc_out_sum, enc_atten_probs])
+      actual_enc_out, actual_enc_out_sum, actual_emb_out_sum, \
+          actual_padding = sess.run(
+              [out.encoded, enc_out_sum, emb_out_sum, enc_padding])
 
       # pyformat: disable
       # pylint: disable=bad-whitespace
@@ -287,11 +289,23 @@ class TransformerEncoderTest(tf.test.TestCase):
             43.02292252,  13.88345146,  15.73033905, -24.68696213,
             24.70776558, -29.18026161,  15.41469955,  27.77672577,
             -5.36326742, -22.78984642,  22.15843391,  22.7237072 ]]
+      expected_emb_out_sum = [
+          [ 3.11785889,  1.33086884, -1.96904886, -4.81911993,  1.25389254,
+            1.52582073,  0.79906291,  4.07078457, -1.20546532, -2.97308111,
+            0.22460097,  2.99702668, -2.29453254,  6.06631422,  1.68836212,
+            5.35728741],
+          [ 1.41723049, -1.39409399, -1.49569404, -0.24654561,  1.09658146,
+            4.51638842,  2.72023368, -0.45651400,  3.46091199, -0.43925080,
+            1.02091551,  3.89704037,  1.87841535, -0.27947778, -0.91630745,
+            1.34230828]]
       # pylint: enable=bad-whitespace
       # pyformat: enable
       self.assertAllEqual(actual_enc_out.shape, [sl, bs, p.model_dim])
-      self.assertAllEqual(actual_atten_probs.shape, [sl, bs])
-      self.assertAllClose(expected_enc_out, actual_enc_out_sum)
+      self.assertAllEqual(actual_padding.shape, [sl, bs])
+      self.assertAllClose(
+          expected_enc_out, actual_enc_out_sum, rtol=1e-05, atol=1e-05)
+      self.assertAllClose(
+          expected_emb_out_sum, actual_emb_out_sum, rtol=1e-05, atol=1e-05)
 
   def testForwardPassWithInputPacking(self):
     with self.session(use_gpu=False) as sess:
@@ -317,11 +331,11 @@ class TransformerEncoderTest(tf.test.TestCase):
             [[0, 0, 0, 1, 1, 1, 2, 2, 2]], dtype=tf.float32)
         packed_batch.segment_pos = tf.constant(
             [[0, 1, 2, 0, 1, 2, 0, 1, 2]], dtype=tf.int32)
-        enc_out = mt_enc.FPropDefaultTheta(batch)[0]
+        enc_out = mt_enc.FPropDefaultTheta(batch).encoded
         enc_out = tf.transpose(enc_out, [1, 0, 2])
 
         packed_enc_out = mt_enc_packed.FPropDefaultTheta(packed_batch)
-        packed_enc_out = tf.reshape(packed_enc_out[0], tf.shape(enc_out))
+        packed_enc_out = tf.reshape(packed_enc_out.encoded, tf.shape(enc_out))
 
         enc_out = tf.reduce_sum(enc_out, axis=0)
         packed_enc_out = tf.reduce_sum(packed_enc_out, axis=0)
@@ -345,24 +359,33 @@ class TransformerEncoderTest(tf.test.TestCase):
       batch.ids = tf.constant(
           np.random.randint(low=0, high=63, size=[bs, sl], dtype=np.int32))
       batch.paddings = tf.zeros([bs, sl])
-      enc_out = mt_enc.FPropDefaultTheta(batch)
+      out = mt_enc.FPropDefaultTheta(batch)
+      enc_out = out.encoded
+      emb_out = out.embedded_inputs
 
       inputs1, inputs2 = tf.split(batch.ids, 2, 0)
       paddings1, paddings2 = tf.split(batch.paddings, 2, 0)
 
       batch.ids = inputs1
       batch.paddings = paddings1
-      enc_out1 = mt_enc.FPropDefaultTheta(batch)
+      out1 = mt_enc.FPropDefaultTheta(batch)
+      enc_out1 = out1.encoded
+      emb_out1 = out1.embedded_inputs
 
       batch.ids = inputs2
       batch.paddings = paddings2
-      enc_out2 = mt_enc.FPropDefaultTheta(batch)
+      out2 = mt_enc.FPropDefaultTheta(batch)
+      enc_out2 = out2.encoded
+      emb_out2 = out2.embedded_inputs
 
       tf.global_variables_initializer().run()
-      actual_enc_out, actual_enc_out1, actual_enc_out2 = sess.run(
-          [enc_out[0], enc_out1[0], enc_out2[0]])
+      actual_enc_out, actual_enc_out1, actual_enc_out2, \
+          actual_emb_out, actual_emb_out1, actual_emb_out2 = sess.run(
+              [enc_out, enc_out1, enc_out2, emb_out, emb_out1, emb_out2])
       self.assertAllClose(actual_enc_out,
                           np.concatenate([actual_enc_out1, actual_enc_out2], 1))
+      self.assertAllClose(actual_emb_out,
+                          np.concatenate([actual_emb_out1, actual_emb_out2], 1))
 
   def testEncoderVars(self):
     p = self._EncoderParams()

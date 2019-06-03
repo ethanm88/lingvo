@@ -187,7 +187,7 @@ class Params(object):
 
   # Note: This gets called by _Param.__eq__() on nested Params objects.
   def __eq__(self, other):
-    return self._params == other._params  # pylint: disable=protected-access
+    return isinstance(other, Params) and self._params == other._params  # pylint: disable=protected-access
 
   def __ne__(self, other):
     return not self == other
@@ -254,8 +254,14 @@ class Params(object):
     for i, part in enumerate(parts[:-1]):
       # Get the value (nested Params object) associated with name 'part'.
       try:
+        is_list = re.match(r'^(.+)\[(.+)\]$', part)
+        if is_list:
+          part = is_list.group(1)
+          list_index = int(is_list.group(2))
         # pylint: disable=protected-access
         curr = curr._params[part].Get()
+        if is_list:
+          curr = curr[list_index]
       except KeyError:
         raise AttributeError('.'.join(parts[:i + 1]))
       assert isinstance(curr, Params), (
@@ -276,7 +282,7 @@ class Params(object):
       self
     """
     if self._immutable:
-      raise TypeError('This Params instance is immutable.')
+      raise TypeError('This Params instance is immutable: %s' % self)
     for name, value in six.iteritems(kwargs):
       # Get nested param.
       param, key = self._GetNested(name)
@@ -380,18 +386,23 @@ class Params(object):
       return type(val).__name__
 
     def Traverse(p, prefix, kv):
-      for key, val in p.IterParams():
-        if isinstance(val, Params):
-          Traverse(val, prefix + key + '.', kv)
-        elif isinstance(val, (six.string_types, six.text_type)):
-          kv[prefix + key] = _QuoteString(val)
-        else:
-          kv[prefix + key] = str(GetRepr(val))
+      """Traverses 'p' and inserts key-value pairs to 'kv'."""
+      if isinstance(p, Params):
+        for key, val in p.IterParams():
+          Traverse(val, prefix + '.' + key, kv)
+      elif (isinstance(p, (list, tuple)) and
+            all(isinstance(x, Params) for x in p)):
+        for i, val in enumerate(p):
+          Traverse(val, '%s[%d]' % (prefix, i), kv)
+      elif isinstance(p, (six.string_types, six.text_type)):
+        kv[prefix] = _QuoteString(p)
+      else:
+        kv[prefix] = str(GetRepr(p))
 
     Traverse(self, '', kv)
     ret = ''
     for (k, v) in sorted(kv.items()):
-      ret += k + ' : ' + v + '\n'
+      ret += k[1:] + ' : ' + v + '\n'
     return ret
 
   def FromText(self, text):
@@ -477,3 +488,25 @@ class Params(object):
       else:
         raise ValueError('Failed to read a parameter: %r : %r' % (key, val))
       self.Set(**{key: val})
+
+
+class InstantiableParams(Params):
+  """Params which can be instantiated.
+
+  When using InstantiableParams, callers must provide a class which supports
+  initialization using a Params instance.
+
+  This covers a common use case of Params to hold a configuration for a given
+  class.
+  """
+
+  def __init__(self, cls=None):
+    super(InstantiableParams, self).__init__()
+    self.Define('cls', cls, 'Cls that this param object is associated with.')
+
+  def Instantiate(self):
+    """Instantiate an instance that this Params is configured for."""
+    assert self.cls is not None
+
+    # The class initializer is expected to support initialization using Params.
+    return self.cls(self)

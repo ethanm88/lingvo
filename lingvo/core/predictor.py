@@ -15,9 +15,12 @@
 # pylint: disable=line-too-long
 """Predictor does inference using a saved inference graph.
 
-Example:
-  params = models.GetModelParams('MyModel', 'Test')
-  pred = Predictor(inference_graph=inference_graph_exporter.Export(params))
+Example::
+
+  params = model_registry.GetParams('MyModel', 'Test')
+  inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+      params)
+  pred = Predictor(inference_graph=inference_graph)
   pred.Load("/tmp/logdir/train/ckpt-00000000")
   [topk_hyps] = pred.Run(["topk_hyps"], src_strings=["Hello World"])
 """
@@ -77,6 +80,7 @@ class Predictor(object):
     if isinstance(inference_graph, six.string_types):
       tf.logging.info("Reading inference graph from %s.", inference_graph)
       inference_graph = LoadInferenceGraph(inference_graph)
+    self._inference_graph = inference_graph
     self._checkpoint = checkpoint
     self._device_type = device_type
     self._tf_master = tf_master
@@ -119,11 +123,21 @@ class Predictor(object):
     """Updates self._sess with a new session."""
     sess = tf.Session(
         self._tf_master, graph=self._graph, config=py_utils.SessionConfig())
-    sess.run(self._graph.get_operation_by_name("init_all_tables"))
+    try:
+      sess.run(self._graph.get_operation_by_name("init_all_tables"))
+    except KeyError:
+      tf.logging.info("Could not find tables initializer in graph.")
     if self._device_type == "tpu":
       sess.run(self._graph.get_operation_by_name("tpu_init_op"))
     if self._checkpoint:
       self._saver.restore(sess, self._checkpoint)
+    else:
+      try:
+        init_op = self._graph.get_operation_by_name("init_all_variables")
+        sess.run(init_op)
+      except KeyError:
+        tf.logging.warn("No checkpoint provided and the graph has no default "
+                        "variable_init op.")
     tf.logging.info("Created new predictor session.")
     self._sess = sess
 

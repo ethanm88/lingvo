@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Language model input generator."""
+"""Punctuator input generator."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -23,9 +23,9 @@ import tensorflow as tf
 
 from lingvo.core import base_input_generator
 from lingvo.core import base_layer
+from lingvo.core import generic_input
 from lingvo.core import py_utils
 from lingvo.core import tokenizers
-from lingvo.core.ops import py_x_ops
 
 
 class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
@@ -35,9 +35,7 @@ class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
   def Params(cls):
     """Defaults params for PunctuatorInput."""
     p = super(PunctuatorInput, cls).Params()
-    p.tokenizer = tokenizers.VocabFileTokenizer.Params()
-    p.tokenizer.tokens_delimiter = ''  # Split each character to a token.
-    p.source_max_length = 300
+    p.tokenizer = tokenizers.WpmTokenizer.Params()
     return p
 
   def _ProcessLine(self, line):
@@ -55,15 +53,23 @@ class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
       A list of tensors, in the expected order by __init__.
     """
     # Tokenize the input into integer ids.
-    tgt_ids, tgt_labels, tgt_paddings = self.StringsToIds([line])
+    # tgt_ids has the start-of-sentence token prepended, and tgt_labels has the
+    # end-of-sentence token appended.
+    tgt_ids, tgt_labels, tgt_paddings = self.StringsToIds(
+        tf.convert_to_tensor([line]))
 
-    # Lowercase and remove punctuation, and tokenize that too.
-    normalized_line = tf.py_func(
-        lambda x: x.lower().translate(None, string.punctuation), [line],
-        tf.string,
-        stateful=False)
-    src_ids, _, src_paddings = self.StringsToIds([normalized_line],
-                                                 is_source=True)
+    def Normalize(line):
+      # Lowercase and remove punctuation.
+      line = line.lower().translate(None, string.punctuation)
+      # Convert multiple consecutive spaces to a single one.
+      line = ' '.join(line.split())
+      return line
+
+    normalized_line = tf.py_func(Normalize, [line], tf.string, stateful=False)
+    _, src_labels, src_paddings = self.StringsToIds(
+        tf.convert_to_tensor([normalized_line]), is_source=True)
+    # The model expects the source without a start-of-sentence token.
+    src_ids = src_labels
 
     # Compute the length for bucketing.
     bucket_key = tf.to_int32(
@@ -88,7 +94,7 @@ class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
       an operation that when executed, calls `_ProcessLine` on a line read
     from `file_pattern`.
     """
-    return py_x_ops.generic_input(
+    return generic_input.GenericInput(
         file_pattern=file_pattern,
         processor=self._ProcessLine,
         # Pad dimension 0 to the same length.

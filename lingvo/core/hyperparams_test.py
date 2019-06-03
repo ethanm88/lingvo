@@ -23,6 +23,7 @@ import re
 
 import tensorflow as tf
 from lingvo.core import hyperparams as _params
+from lingvo.core import test_utils
 
 FLAGS = tf.flags.FLAGS
 
@@ -37,7 +38,7 @@ class TestClass2(object):
   pass
 
 
-class ParamsTest(tf.test.TestCase):
+class ParamsTest(test_utils.TestCase):
 
   def testEquals(self):
     params1 = _params.Params()
@@ -62,6 +63,9 @@ class ParamsTest(tf.test.TestCase):
     self.assertFalse(params1 == params2)
     params2.third.fourth = 'x'
     self.assertTrue(params1 == params2)
+    # Comparing params to non-param instances.
+    self.assertFalse(params1 == 3)
+    self.assertFalse(3 == params1)
 
   def testDeepCopy(self):
     inner = _params.Params()
@@ -245,6 +249,7 @@ class ParamsTest(tf.test.TestCase):
     outer.Define('dtype2', tf.int32, '')
     outer.Define('seqlen', [10, inner, 30], '')
     outer.Define('tuple', (1, None), '')
+    outer.Define('list_of_params', [inner.Copy()], '')
     outer.Define('class', TestClass1, '')
     outer.Define('plain_dict', {'a': 10}, '')
     outer.Define('complex_dict', {'a': 10, 'b': inner}, '')
@@ -262,6 +267,8 @@ dtype2 : int32
 foo : 1
 inner.bar : 2.71
 inner.baz : 'hello'
+list_of_params[0].bar : 2.71
+list_of_params[0].baz : 'hello'
 optional_bool : NoneType
 plain_dict : {'a': 10}
 seqlen : [10, {'bar': 2.71, 'baz': 'hello'}, 30]
@@ -275,6 +282,7 @@ tuple : (1, 'NoneType')
         inner.baz : 'world'
         # foo : 123
         optional_bool : true
+        list_of_params[0].bar : 2.72
         seqlen : [1, 2.0, '3', [4]]
         plain_dict : {'x': 0.3}
         class : type/__main__/TestClass2
@@ -293,6 +301,8 @@ dtype2 : float32
 foo : 1
 inner.bar : 2.71
 inner.baz : 'world'
+list_of_params[0].bar : 2.72
+list_of_params[0].baz : 'hello'
 optional_bool : True
 plain_dict : {'x': 0.3}
 seqlen : [1, 2.0, '3', [4]]

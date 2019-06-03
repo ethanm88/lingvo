@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Encoders for the speech model."""
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import collections
-
 from six.moves import range
 from six.moves import zip
 import tensorflow as tf
@@ -26,12 +26,13 @@ from tensorflow.python.ops import inplace_ops
 from lingvo.core import base_encoder
 from lingvo.core import base_layer
 from lingvo.core import layers
+from lingvo.core import model_helper
 from lingvo.core import plot
 from lingvo.core import py_utils
 from lingvo.core import rnn_cell
 from lingvo.core import rnn_layers
+from lingvo.core import spectrum_augmenter
 from lingvo.core import summary_utils
-from lingvo.core import model_helper
 
 ConvLSTMBlock = collections.namedtuple('ConvLSTMBlock', ('rnn', 'cnn'))
 
@@ -43,6 +44,10 @@ class AsrEncoder(base_encoder.BaseEncoder):
   def Params(cls):
     """Configs for AsrEncoder."""
     p = super(AsrEncoder, cls).Params()
+    p.Define('specaugment_network',
+             spectrum_augmenter.SpectrumAugmenter.Params(),
+             'Configs template for the agumentation network.')
+    p.Define('use_specaugment', False, 'Use specaugmentation or not.')
     p.Define('lstm_tpl', rnn_cell.LSTMCellSimple.Params(),
              'Configs template for the RNN layer.')
     p.Define('cnn_tpl', layers.ConvLayer.Params(),
@@ -82,6 +87,12 @@ class AsrEncoder(base_encoder.BaseEncoder):
         'bidi_rnn_type', 'func', 'Options: func, native_cudnn. '
         'func: BidirectionalFRNN, '
         'native_cudnn: BidirectionalNativeCuDNNLSTM.')
+    p.Define(
+        'extra_per_layer_outputs', False,
+        'Whether to output the encoding result from each encoder layer besides '
+        'the regular final output. The corresponding extra outputs are keyed '
+        'by "${layer_type}_${layer_index}" in the encoder output NestedMap, '
+        'where layer_type is one of: "conv", "conv_lstm" and "rnn".')
 
     # TODO(yonghui): Maybe move those configs to a separate file.
     # Set some reasonable default values.
@@ -131,11 +142,14 @@ class AsrEncoder(base_encoder.BaseEncoder):
   def __init__(self, params):
     super(AsrEncoder, self).__init__(params)
     p = self.params
-    assert p.packed_input is False, ('Packed inputs are not yet supported for '
-                                     'AsrEncoder.')
+    assert not p.packed_input, ('Packed inputs are not yet supported for '
+                                'AsrEncoder.')
     name = p.name
 
     with tf.variable_scope(name):
+      # Use specAugment or not.
+      if p.use_specaugment:
+        self.CreateChild('specaugment', p.specaugment_network.Copy())
       # First create the conv layers.
 
       assert p.num_cnn_layers == len(p.conv_filter_shapes)
@@ -150,10 +164,9 @@ class AsrEncoder(base_encoder.BaseEncoder):
         params_conv_layers.append(conv_p)
       self.CreateChildren('conv', params_conv_layers)
 
-      conv_output_shape = tf.TensorShape(p.input_shape)
+      conv_output_shape = p.input_shape
       for i in range(p.num_cnn_layers):
         conv_output_shape = self.conv[i].OutShape(conv_output_shape)
-      conv_output_shape = conv_output_shape.as_list()
       assert len(conv_output_shape) == 4  # batch, height, width, channel.
 
       params_conv_lstm_rnn = []
@@ -270,19 +283,32 @@ class AsrEncoder(base_encoder.BaseEncoder):
       theta: A NestedMap object containing weights' values of this
         layer and its children layers.
       batch: A NestedMap with fields:
-        src_inputs - The inputs tensor. It is expected to be of shape [batch,
-            time, feature_dim, channels].
-        paddings - The paddings tensor. It is expected to be of shape [batch,
+
+        - src_inputs - The inputs tensor. It is expected to be of shape [batch,
+          time, feature_dim, channels].
+        - paddings - The paddings tensor. It is expected to be of shape [batch,
           time].
       state0: Recurrent input state. Not supported/ignored by this encoder.
 
     Returns:
-      (outputs, out_paddings, state1) tuple. Outputs is of the shape
-      [time, batch, depth], and out_paddings is of the shape [time, batch]
+      A NestedMap containing:
+
+      - 'encoded': a feature tensor of shape [time, batch, depth]
+      - 'padding': a 0/1 tensor of shape [time, batch]
+      - 'state': the updated recurrent state
+      - '${layer_type}_${layer_index}': The per-layer encoder output. Each one
+        is a NestedMap containing 'encoded' and 'padding' similar to regular
+        final outputs, except that 'encoded' from conv or conv_lstm layers are
+        of shape [time, batch, depth, channels].
     """
     p = self.params
     inputs, paddings = batch.src_inputs, batch.paddings
+    outputs = py_utils.NestedMap()
     with tf.name_scope(p.name):
+      # Adding specAugmentation.
+      if p.use_specaugment and not p.is_eval:
+        inputs, paddings = self.specaugment.FProp(theta.specaugment, inputs,
+                                                  paddings)
       # Add a few extra padded timesteps at the end. This is for ensuring the
       # correctness of the conv-layers at the edges.
       if p.pad_steps > 0:
@@ -317,6 +343,11 @@ class AsrEncoder(base_encoder.BaseEncoder):
       for i, conv_layer in enumerate(self.conv):
         conv_out, out_padding = conv_layer.FProp(theta.conv[i], conv_out,
                                                  out_padding)
+        if p.extra_per_layer_outputs:
+          conv_out *= (1.0 - out_padding[:, :, tf.newaxis, tf.newaxis])
+          outputs['conv_%d' % i] = py_utils.NestedMap(
+              encoded=tf.transpose(conv_out, [1, 0, 2, 3]),  # to [t, b, d, c]
+              padding=tf.transpose(out_padding))
         plots.append(
             ReshapeForPlot(
                 tf.transpose(conv_out, [0, 1, 3, 2]), out_padding,
@@ -350,6 +381,13 @@ class AsrEncoder(base_encoder.BaseEncoder):
         cnn_out, cnn_out_padding = cnn.FProp(theta.conv_lstm_cnn[i], cnn_in,
                                              cnn_in_padding)
         conv_lstm_out, conv_lstm_out_padding = cnn_out, cnn_out_padding
+        if p.extra_per_layer_outputs:
+          conv_lstm_out *= (
+              1.0 - conv_lstm_out_padding[:, :, tf.newaxis, tf.newaxis])
+          outputs['conv_lstm_%d' % i] = py_utils.NestedMap(
+              encoded=tf.transpose(conv_lstm_out,
+                                   [1, 0, 2, 3]),  # to [t, b, d, c]
+              padding=tf.transpose(conv_lstm_out_padding))
         plots.append(
             ReshapeForPlot(conv_lstm_out, conv_lstm_out_padding,
                            'conv_lstm_%d_out' % i))
@@ -395,6 +433,10 @@ class AsrEncoder(base_encoder.BaseEncoder):
           rnn_out = self.proj[i].FProp(theta.proj[i], rnn_out, rnn_padding)
         if i == p.num_lstm_layers - 1:
           rnn_out *= (1.0 - rnn_padding)
+        if p.extra_per_layer_outputs:
+          rnn_out *= (1.0 - rnn_padding)
+          outputs['rnn_%d' % i] = py_utils.NestedMap(
+              encoded=rnn_out, padding=tf.squeeze(rnn_padding, [2]))
         plots.append(
             ReshapeForPlot(
                 tf.transpose(rnn_out, [1, 0, 2]),
@@ -416,5 +458,7 @@ class AsrEncoder(base_encoder.BaseEncoder):
               xlabel='Time')
         fig.Finalize()
 
-      rnn_padding = tf.squeeze(rnn_padding, [2])
-      return final_out, rnn_padding, py_utils.NestedMap()
+      outputs['encoded'] = final_out
+      outputs['padding'] = tf.squeeze(rnn_padding, [2])
+      outputs['state'] = py_utils.NestedMap()
+      return outputs

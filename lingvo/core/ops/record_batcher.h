@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef LINGVO_CORE_OPS_RECORD_BATCHER_H_
 #define LINGVO_CORE_OPS_RECORD_BATCHER_H_
 
+#include <cstddef>
 #include <vector>
 
 #include "tensorflow/core/framework/tensor.h"
@@ -51,9 +52,9 @@ class RecordProcessor {
   virtual Status Process(const Rope& record, int64* bucket_key,
                          TensorVec* sample) = 0;
 
-  // Gives a list of training 'samples', all of which returned by Process() and
-  // bucketized into 'bucket_id'-th bucket, merges them into a single 'batch'.
-  virtual Status Merge(int64 bucket_id, const std::vector<TensorVec>& samples,
+  // Gives a list of training 'samples' returned by Process() and bucketed into
+  // a bucket with size `bucket_size`, merges them into a single 'batch'.
+  virtual Status Merge(int64 bucket_size, const std::vector<TensorVec>& samples,
                        TensorVec* batch) = 0;
 };
 
@@ -74,6 +75,10 @@ class RecordBatcher {
     // REQUIRES: bucket_upper_bound.size() == bucket_batch_limit.size()
     std::vector<int64> bucket_upper_bound;
     std::vector<int64> bucket_batch_limit;
+
+    // If non-zero, optimize bucket_upper_bound values (except the last one)
+    // every n records based on input lengths.
+    int64 bucket_adjust_every_n = 0;
 
     // If non-zero, flushes all batches buffered so far every these
     // many records are yielded.
@@ -118,6 +123,12 @@ class RecordBatcher {
   FlushList to_flush_ GUARDED_BY(mu_);
   Condition to_flush_empty_;
   Condition to_flush_non_empty_;
+  std::time_t start_time_;  // Not necessary to guard.
+  std::time_t last_log_update_time_ GUARDED_BY(mu_);
+  int64 next_status_update_duration_seconds_ GUARDED_BY(mu_) = 60;
+
+  std::vector<int64> length_histogram_;
+  std::vector<int64> bucket_upper_bound_;
 
   // Conditions.
   bool CurrEmpty() const SHARED_LOCKS_REQUIRED(mu_) {
@@ -138,6 +149,10 @@ class RecordBatcher {
 
   void ProcessorLoop();
   void MergerLoop();
+
+  void AdjustBuckets() EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void FlushAllBuckets() EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void IncrementHistogram(int64 bucket) EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   // For performance debugging.
   void WaitForCurrEmpty() EXCLUSIVE_LOCKS_REQUIRED(mu_);

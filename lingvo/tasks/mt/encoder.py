@@ -82,8 +82,8 @@ class MTEncoderV1(base_encoder.BaseEncoder):
   def __init__(self, params):
     super(MTEncoderV1, self).__init__(params)
     p = self.params
-    assert p.packed_input is False, ('Packed inputs are not yet supported for '
-                                     'MTEncoderV1.')
+    assert not p.packed_input, ('Packed inputs are not yet supported for '
+                                'MTEncoderV1.')
 
     with tf.variable_scope(p.name):
       if p.cc_schedule is not None:
@@ -96,9 +96,10 @@ class MTEncoderV1(base_encoder.BaseEncoder):
       # L0 is a bi-directional lstm.
 
       # L0's forward lstm cell
-      params = (
-          p.lstm_tpl.Copy()
-          if p.lstm_tpl_bidi is None else p.lstm_tpl_bidi.Copy())
+      if p.lstm_tpl_bidi is None:
+        params = p.lstm_tpl.Copy()
+      else:
+        params = p.lstm_tpl_bidi.Copy()
       params.name = 'L0_rnn_fwd'
       params.num_input_nodes = p.emb.embedding_dim
       params.num_output_nodes = p.lstm_cell_size
@@ -119,9 +120,10 @@ class MTEncoderV1(base_encoder.BaseEncoder):
       input_size = 2 * p.lstm_cell_size
       for i in range(1, p.num_lstm_layers):
         # Forward lstm cell.
-        cell = (
-            p.lstm_tpl.Copy()
-            if p.lstm_tpl_uni is None else p.lstm_tpl_uni.Copy())
+        if p.lstm_tpl_uni is None:
+          cell = p.lstm_tpl.Copy()
+        else:
+          cell = p.lstm_tpl_uni.Copy()
         cell.name = 'L%d_rnn' % i
         cell.num_input_nodes = input_size
         cell.num_output_nodes = p.lstm_cell_size
@@ -143,7 +145,7 @@ class MTEncoderV1(base_encoder.BaseEncoder):
     p = self.params
     if not p.cc_schedule:
       return x
-    cap = tf.cast(self.cc_schedule.CurrentCap(theta.cc_schedule), x.dtype)
+    cap = tf.cast(self.cc_schedule.GetState(theta.cc_schedule), x.dtype)
     return tf.clip_by_value(x, -cap, cap)
 
   def FProp(self, theta, input_batch):
@@ -157,11 +159,11 @@ class MTEncoderV1(base_encoder.BaseEncoder):
         - paddings: The paddings tensor. Expected shape [batch, time].
 
     Returns:
-      (outputs, out_paddings, src_segment_id) tuple.
-      `outputs` is of the shape [time, batch, depth], and `out_paddings` is of
-      the shape [time, batch]. `src_segment_id` should have the shape
-      [time, batch] if packed inputs are supported by the model (and all
-      layers), or None otherwise.
+      A NestedMap containing:
+        - encoded: The encoded features, a tensor of shape [time, batch, depth]
+        - padding: of shape [time, batch]
+        - segment_id: [time, batch] if packed inputs are supported by the model
+            (and all layers), or None otherwise.
     """
     p = self.params
     src_segment_id = None
@@ -198,7 +200,8 @@ class MTEncoderV1(base_encoder.BaseEncoder):
           # QuantizedLSTMCell with the same cc_schedule so that the RNN layer
           # output is within clipping range.
           xs = ys
-      return xs, tf.squeeze(ps, [2]), src_segment_id
+      return py_utils.NestedMap(
+          encoded=xs, padding=tf.squeeze(ps, [2]), segment_id=src_segment_id)
 
 
 class MTEncoderUniRNN(base_encoder.BaseEncoder):
@@ -246,8 +249,8 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
   def __init__(self, params):
     super(MTEncoderUniRNN, self).__init__(params)
     p = self.params
-    assert p.packed_input is False, ('Packed inputs are not yet supported for '
-                                     'MTEncoderUniRNN.')
+    assert not p.packed_input, ('Packed inputs are not yet supported for '
+                                'MTEncoderUniRNN.')
 
     with tf.variable_scope(p.name):
       if p.cc_schedule is None:
@@ -290,16 +293,26 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
     else:
       return x
 
-  def FProp(self, theta, input_batch):
+  def zero_state(self, batch_size):
+    return py_utils.NestedMap(rnn=[l.zero_state(batch_size) for l in self.rnn])
+
+  def FProp(self, theta, input_batch, state0=None):
     p = self.params
     src_segment_id = None
     with tf.name_scope(p.name):
+      # Reshape to [t, b]
       inputs = py_utils.with_dependencies([
           py_utils.assert_shape_match(tf.shape(input_batch.ids), [-1, -1]),
           py_utils.assert_shape_match(
               tf.shape(input_batch.ids), tf.shape(input_batch.paddings))
       ], tf.transpose(input_batch.ids))
       paddings = tf.expand_dims(tf.transpose(input_batch.paddings), 2)
+
+      # Setup streaming states.
+      if not state0:
+        state0 = self.zero_state(tf.shape(inputs)[1])
+      state1 = py_utils.NestedMap(rnn=[None] * p.num_lstm_layers)
+
       xs = self.emb.EmbLookup(theta.emb, inputs)
       xs = self.ApplyClipping(theta, xs)
       summary_utils.histogram('input_emb', xs)
@@ -309,7 +322,8 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
       outputs_list = []
       for i in range(0, p.num_lstm_layers):
         layer = self.rnn[i]
-        ys, _ = layer.FProp(theta.rnn[i], xs, ps)
+        ys, state1.rnn[i] = layer.FProp(
+            theta.rnn[i], xs, ps, state0=state0.rnn[i])
         ys = self.dropout.FProp(theta.dropout, ys)
         if i >= p.residual_start:
           xs += ys  # Residual skip
@@ -323,7 +337,11 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
         xs = self.transparent_merger.FProp(theta.transparent_merger,
                                            outputs_list)
 
-      return xs, tf.squeeze(ps, [2]), src_segment_id
+      return py_utils.NestedMap(
+          encoded=xs,
+          padding=tf.squeeze(ps, [2]),
+          segment_id=src_segment_id,
+          state=state1)
 
 
 class MTEncoderBiRNN(base_encoder.BaseEncoder):
@@ -489,7 +507,8 @@ class MTEncoderBiRNN(base_encoder.BaseEncoder):
       if src_segment_id is not None:
         src_segment_id = tf.squeeze(src_segment_id, [2])
 
-      return xs, tf.squeeze(ps, [2]), src_segment_id
+      return py_utils.NestedMap(
+          encoded=xs, padding=tf.squeeze(ps, [2]), segment_id=src_segment_id)
 
 
 class TransformerEncoder(base_encoder.BaseEncoder):
@@ -575,13 +594,17 @@ class TransformerEncoder(base_encoder.BaseEncoder):
         - paddings: The paddings tensor. Expected shape [batch, time].
 
     Returns:
-      (outputs, out_paddings, src_segment_id) tuple. `outputs` is of the shape
-      [time, batch, depth], and `out_paddings` has shape [time, batch].
-      `outputs` can be a list of output tensors if is_transparent is set in
-      transformer_stack. `src_segment_id` should have the shape [time, batch]
-      if packed inputs are supported by the model (and all layers), or None
-      otherwise.
+      A NestedMap containing:
+        - encoded: The encoded features, either a tensor of shape [time, batch,
+            depth], or a list of tensors if is_transparent is set in
+            transformer_stack.
+        - padding: of shape [time, batch]
+        - segment_id: [time, batch] if packed inputs are supported by the model
+            (and all layers), or None otherwise.
+        - embedded_inputs: [time, batch, depth] embedded inputs tokens without
+            positional encodings.
     """
+
     p = self.params
     with tf.name_scope(p.name):
       src_segment_id = None
@@ -620,6 +643,9 @@ class TransformerEncoder(base_encoder.BaseEncoder):
                                             tf.reshape(input_ids, [-1]))
       input_embs = tf.reshape(input_embs,
                               [-1, max_time, p.token_emb.embedding_dim])
+      # [time, batch, dim]
+      orig_input_embs = tf.transpose(input_embs, [1, 0, 2])
+
       if p.packed_input:
         position_embs = self.position_emb.FPropWithPosition(
             theta.position_emb, src_segment_pos)
@@ -640,5 +666,10 @@ class TransformerEncoder(base_encoder.BaseEncoder):
       # [time, batch, dim]
       transformer_input = tf.transpose(input_embs, [1, 0, 2])
 
-    return self.transformer_stack.FProp(
+    encoded, padding, segment_id = self.transformer_stack.FProp(
         theta.transformer_stack, transformer_input, paddings, src_segment_id)
+    return py_utils.NestedMap(
+        encoded=encoded,
+        padding=padding,
+        segment_id=segment_id,
+        embedded_inputs=orig_input_embs)

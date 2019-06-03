@@ -22,14 +22,14 @@ import os
 import numpy as np
 from six.moves import range
 import tensorflow as tf
-
 from lingvo.core import early_stop
 from lingvo.core import task_scheduler
+from lingvo.core import test_utils
 
 _NUMPY_RANDOM_SEED = 9885784
 
 
-class SchedulerTests(tf.test.TestCase):
+class SchedulerTests(test_utils.TestCase):
 
   def _TestSchedulerHelper(self, schedule, global_step, count_a):
     np.random.seed(_NUMPY_RANDOM_SEED)
@@ -46,7 +46,7 @@ class SchedulerTests(tf.test.TestCase):
     p = task_scheduler.ConstantScheduler.Params()
     p.task_probs = [('a', 0.8), ('b', 0.2)]
 
-    schedule = p.cls(p)
+    schedule = p.Instantiate()
 
     self._TestSchedulerHelper(schedule, 0, 83)
 
@@ -62,7 +62,7 @@ class SchedulerTests(tf.test.TestCase):
     p.alpha = 1e-5
     p.task_probs = [('a', (0, 1)), ('b', (1, 0))]
 
-    schedule = p.cls(p)
+    schedule = p.Instantiate()
 
     self._TestSchedulerHelper(schedule, global_step=0, count_a=0)
     self._TestSchedulerHelper(schedule, global_step=1e5, count_a=63)
@@ -80,7 +80,7 @@ class SchedulerTests(tf.test.TestCase):
     p.alpha = 1e-5
     p.task_probs = [('a', (0.5, 1)), ('b', (0.5, 0))]
 
-    schedule = p.cls(p)
+    schedule = p.Instantiate()
 
     self._TestSchedulerHelper(schedule, global_step=0, count_a=54)
     self._TestSchedulerHelper(schedule, global_step=1e5, count_a=73)
@@ -112,7 +112,7 @@ class SchedulerTests(tf.test.TestCase):
     p.mh_a = mh_a
     p.mh_b = mh_b
 
-    schedule = p.cls(p)
+    schedule = p.Instantiate()
 
     early_stop.MetricHistory.ConditionalAppend(mh_a.jobname, mh_a.metric, 1,
                                                0.05)
@@ -151,7 +151,7 @@ class SchedulerTests(tf.test.TestCase):
     p = task_scheduler.RoundRobinScheduler.Params()
     p.tasks = ['a', 'b']
 
-    schedule = p.cls(p)
+    schedule = p.Instantiate()
     for global_step in range(20):
       task = schedule.Sample(global_step)
       if global_step % 2 == 0:

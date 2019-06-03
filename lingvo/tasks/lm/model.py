@@ -23,8 +23,8 @@ import tensorflow as tf
 
 from lingvo.core import base_layer
 from lingvo.core import base_model
-from lingvo.core import lr_schedule
 from lingvo.core import py_utils
+from lingvo.core import schedule
 from lingvo.tasks.lm import layers
 
 
@@ -46,7 +46,7 @@ class LanguageModel(base_model.BaseTask):
         'Sum the logP across predicted tokens in batch when set to True; '
         'average across predicted tokens in batch o/w (default).')
 
-    tp.lr_schedule = lr_schedule.PiecewiseConstantLearningRateSchedule.Params(
+    tp.lr_schedule = schedule.PiecewiseConstantLearningRateSchedule.Params(
     ).Set(
         boundaries=[350000, 500000, 600000], values=[1.0, 0.1, 0.01, 0.001])
     tp.vn_start_step = 20000
@@ -111,7 +111,7 @@ class LanguageModel(base_model.BaseTask):
         'log_pplx_per_word': (xent_output.total_xent / num_words, num_words),
         'num_predictions': (num_preds, 1),
         'num_words': (num_words, 1)
-    }
+    }, {}
 
   def AdjustGradients(self, var_grad):
     """Clip LSTM gradients.
@@ -156,21 +156,26 @@ class LanguageModel(base_model.BaseTask):
     """Default inference subgraph.
 
     Returns:
-      fetches: A dictionary of fetches, containing:
-        log_pplx_per_token: A matrix of shape [batch, time]. [i, j]
+      (fetches, feeds), with:
+
+      - fetches: A dictionary of fetches, containing:
+
+        - log_pplx_per_token: A matrix of shape [batch, time]. [i, j]
           is i-th input text's j-th token's log prob.
-        paddings: A matrix of shape [batch, time]. The padding mask.
-        log_pplx_per_sample: A vector of shape [batch]. [i]
+        - paddings: A matrix of shape [batch, time]. The padding mask.
+        - log_pplx_per_sample: A vector of shape [batch]. [i]
           is i-th input text's log prob.
-        num_oovs_per_sample: A vector of shape [batch] counting the total number
-          of out-of-vocabulary tokens in each input.
-        tokens_from_labels: A vector of shape [batch] returning the predicted
+        - num_oovs_per_sample: A vector of shape [batch] counting the total
+          number of out-of-vocabulary tokens in each input.
+        - tokens_from_labels: A vector of shape [batch] returning the predicted
           tokens as a sequence after mapping them back to strings from ids using
           the vocabulary.
-        ids: A matrix of shape [batch, time]. [i, j]
+        - ids: A matrix of shape [batch, time]. [i, j]
           is i-th input text's j-th token's id.
-      feeds: A dictionary of feeds, containing:
-        text: A placeholder for a vector of strings.
+
+      - feeds: A dictionary of feeds, containing:
+
+        - text: A placeholder for a vector of strings.
     """
     text = tf.placeholder(tf.string, shape=[None])
     # [batch, time]
@@ -212,3 +217,14 @@ class LanguageModel(base_model.BaseTask):
     }
     feeds = {'text': text}
     return fetches, feeds
+
+
+class FixedShapeInputLanguageModel(LanguageModel):
+
+  def _TrimIfPossibleThenTranspose(self, ids, paddings, labels, weights):
+    data = (ids, paddings, labels, weights)
+    if not py_utils.use_tpu() and self.params.is_eval:
+      max_seq_len = tf.cast(
+          tf.reduce_max(tf.reduce_sum(1.0 - paddings, 1)), tf.int32)
+      data = (x[:, :max_seq_len] for x in data)
+    return (tf.transpose(x) for x in data)

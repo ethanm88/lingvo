@@ -84,7 +84,8 @@ REGISTER_OP("BestStep")
 
 Determines the best global step from a history file.
 
-best_step: Scalar value for best global step.
+best_step: Shape [2]. best_step[0] is scalar value for best global step.
+  best_step[1] is scalar value for last global step.
 hist_file: A text file containing 'step score' records, or a file pattern that
     matches tf event files in the format of /path_to_file/events.out.tfevents*.
 tol: Difference between previous best score and current score must be greater
@@ -106,7 +107,6 @@ REGISTER_OP("BeamSearchStep")
     .Input("in_atten_probs: float32")
     .Input("is_last_chunk: bool")
     .Input("cur_step: int32")
-    .Input("lm_log_probs: float32")
     .Output("out_best_scores: float32")
     .Output("out_cumulative_scores: float32")
     .Output("out_scores: float32")
@@ -120,10 +120,11 @@ REGISTER_OP("BeamSearchStep")
     .Attr("beam_size: float")
     .Attr("num_hyps_per_beam: int")
     .Attr("valid_eos_max_logit_delta: float = 5.0")
-    .Attr("lm_weight: float = 0.0")
+    .Attr("local_eos_threshold: float = -100.0")
     .Attr("merge_paths: bool = false")
     .Attr("allow_empty_terminated_hyp: bool = true")
     .Attr("ensure_full_beam: bool = false")
+    .Attr("force_eos_in_last_step: bool = false")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(2));
       c->set_output(1, c->input(3));
@@ -186,11 +187,6 @@ in_prev_hyps: As explained above.
 in_done_hyps: As explained above.
 in_atten_probs: As explained above.
 cur_step: Current step id.
-lm_log_probs: A matrix of shape [b * k, vocab_size], where b is the number of
-    active beams, and k is the number of hyps in each beam. Local scores for the
-    current timestep according to a language model.  These scores will be used
-    to adjust scores of the top k hyps if lm_weight is nonzero (see
-    `lm_weight` below).
 out_best_scores:
     Updated best scores for each of the beams.
 out_cumulative_scores:
@@ -216,16 +212,8 @@ num_hyps_per_beam: Number of hyps in a beam.
 valid_eos_max_logit_delta: We allow </s> to terminate a hyp only if its logit
     is no more than `valid_eos_max_logit_delta` away from the logit of the best
     candidate.
-lm_weight: A scalar specifying how much weight to place on `lm_log_probs` when
-    determining the scores of the top k hyps.  If lm_weight is zero, the local
-    score of each hyp is the score of the chosen word according to `scores`.
-    Otherwise, the local score is a linear combination of the chosen word
-    according to `scores` and `lm_log_probs`, with:
-    effective score = scores + (lm_log_probs * lm_weight).
-    Note that this rescoring is done only after the top k hyps have been chosen
-    using `scores` alone, such that `lm_log_probs` do not actually change what
-    the top k hyps are, in a given step.  Global score remains the sum of local
-    scores.
+local_eos_threshold: We allow </s> to terminate a hyp if the local score for
+    </s> is greater than local_eos_threshold.
 merge_paths: If true, hyps which are identical when epsilons are removed will
     be combined into a single hyp.  The probability for that combined hyp will
     be the sum of the probabilities of the component hyps.  This can only be
@@ -242,6 +230,11 @@ ensure_full_beam: If True, we will not set the all_done output to True until we
      score within 'beam_size' of the best terminated hyp.  If False, only the
      second condition must be satisfied.  Generally this should be False unless
      beam search is being run as part of minimum word error rate training.
+force_eos_in_last_step: If true, then if decode does not terminate even after
+    (max - 1) steps, eos symbol is injected into the result and partial
+    hypotheses (with a valid eos symbol in the end) are returned. all_done
+    is set to true for these partials. If false, which is the default behavior,
+    empty hypothesis are returned and all_done is set to false at termination.
 )doc");
 
 REGISTER_OP("TopKTerminatedHyps")
@@ -273,9 +266,10 @@ Compute the top k terminated hyps based on normalized score for each beam.
 Let "b" be the number of beams, "h" be the number hyps in each beam, "t" be the
 maximum decoding steps.
 
-in_done_hyps: A tensor of shape [t, b * h]. in_done_hyps[i, j] can be either
-    an empty string, or a serialized Hypothesis proto. The non-empty hyps in
-    in_done_hyps are terminated hyps.
+in_done_hyps: A tensor of shape [t, h * b]. Each string in in_done_hyps can be
+    either an empty string, or a serialized Hypothesis proto. If not empty,
+    in_done_hyps[t, i * num_beams + j] represents the i-th hypothesis for beam
+    j that terminates at step t.
 src_seq_lengths: A tensor of shape [b] of the src sequence lengths.
 out_topk_hyps:
     A string tensor of shape [b, k]. topk_hyps[i: ] contains
@@ -300,7 +294,7 @@ REGISTER_OP("UnpackHyp")
     .Output("out_ids: int32")
     .Output("out_seq_lens: int32")
     .Output("out_scores: float32")
-    .Attr("max_seq_length: int")
+    .Attr("max_seq_length: int = 0")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       auto batch_size = c->NumElements(c->input(0));
       int k;
@@ -320,7 +314,7 @@ Unpacks hyps into tensors of ids, seq_len and scores.
 in_hyps: A vector of serialized `Hypothesis` protos.
 out_ids:
     Output sequences, a matrix of shape (batch_size, max_seq_length).
-    Sequences shorter than max_seq_length are padded with 0s.
+    Sequences shorter than max_seq_length are padded with 0s. If max_seq_length is 0, derive it from the longest sequence in input_hyps.
 out_seq_lens:
     Length of each of the output sequence, a vector of size `batch_size`.
 out_scores:
@@ -380,6 +374,60 @@ output: A list of output tensors whose types are T.
 f: A function that returns a list of tensors (T).
 )doc");
 
+REGISTER_OP("VocabTokenToId")
+    .Input("token: string")
+    .Output("id: int32")
+    .Attr("vocab: list(string)")
+    .Attr("load_token_ids_from_vocab: bool = false")
+    .SetIsStateful()
+    .SetShapeFn(shape_inference::UnchangedShape)
+    .Doc(R"doc(
+Looks up the token in the vocab and return its id.
+
+token: A scalar or list of strings.
+id: A scalar or list of ints.
+vocab: A list of strings.
+load_token_ids_from_vocab: Whether token ids are present in vocab (i.e. vocab
+    contains two colums, one for IDs and one for words).  If false, line numbers
+    are used.
+)doc");
+
+REGISTER_OP("VocabIdToToken")
+    .Input("id: int32")
+    .Output("token: string")
+    .Attr("vocab: list(string)")
+    .Attr("load_token_ids_from_vocab: bool = false")
+    .SetIsStateful()
+    .SetShapeFn(shape_inference::UnchangedShape)
+    .Doc(R"doc(
+Looks up the token at the given id from a vocab.
+
+id: A scalar or list of ints.
+token: A scalar or list of strings.
+vocab: A list of strings.
+load_token_ids_from_vocab: Whether token ids are present in vocab (i.e. vocab
+    contains two colums, one for IDs and one for words).  If false, line numbers
+    are used.
+)doc");
+
+REGISTER_OP("TokenInVocab")
+    .Input("token: string")
+    .Output("result: bool")
+    .Attr("vocab: list(string)")
+    .Attr("load_token_ids_from_vocab: bool = false")
+    .SetIsStateful()
+    .SetShapeFn(shape_inference::UnchangedShape)
+    .Doc(R"doc(
+Checks whether the provided token is in the vocab.
+
+token: A scalar or list of strings.
+result: A scalar or list of bools.
+vocab: A list of strings.
+load_token_ids_from_vocab: Whether token ids are present in vocab (i.e. vocab
+    contains two colums, one for IDs and one for words).  If false, line numbers
+    are used.
+)doc");
+
 REGISTER_OP("AsciiToTokenId")
     .Input("labels: string")
     .Output("token_ids: int32")
@@ -387,6 +435,7 @@ REGISTER_OP("AsciiToTokenId")
     .Output("paddings: float")
     .Attr("append_eos: bool = true")
     .Attr("maxlen: int = 300")
+    .Attr("pad_to_maxlen: bool = true")
     .Doc(R"doc(
 Converts ASCII label strings into token ids.
 
@@ -401,6 +450,8 @@ paddings: A matrix of shape [batch, maxlen].
     j-th target token is padded and should be ignored.
 append_eos: Whether to append </s> at the end and treat it as a non-padded
     label.
+maxlen: an integer, sequence length of the output tensors.
+pad_to_maxlen: Whether to pad the output to maxlen.
 )doc");
 
 REGISTER_OP("StrToVocabTokens")
@@ -410,6 +461,7 @@ REGISTER_OP("StrToVocabTokens")
     .Output("paddings: float")
     .Attr("append_eos: bool = true")
     .Attr("maxlen: int = 300")
+    .Attr("pad_to_maxlen: bool = true")
     .Attr("vocab_filepath: string")
     .Attr("load_token_ids_from_vocab: bool = true")
     .Attr("delimiter: string = ' '")
@@ -437,6 +489,7 @@ paddings: A matrix of shape [batch, maxlen].
 append_eos: Whether to append </s> at the end and treat it as a non-padded
     label.
 maxlen: an integer, sequence length of the output tensors.
+pad_to_maxlen: Whether to pad the output to maxlen.
 vocab_filepath: a string, filepath to the vocab file.
 load_token_ids_from_vocab: Whether token ids are present in vocab (i.e. vocab
     contains two colums, one for IDs and one for words).  If false, line numbers
@@ -462,6 +515,10 @@ REGISTER_OP("NgramIdToToken")
     .Input("token_ids: int32")
     .Input("seq_lengths: int32")
     .Output("sequences: string")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(1));
+      return Status::OK();
+    })
     .Attr("ngram_vocab_filepath: string")
     .Attr("ngram_separator: string = \"\"")
     .Doc(R"doc(
@@ -545,8 +602,6 @@ sequences: The string sequences. The shape is [batch_size].
 vocab_filepath: A path to a text file where each line is a BPE string token.
 )doc");
 
-
-
 REGISTER_OP("GenericInput")
     .Output("out: out_types")
     .INPUT_ATTRS  // Common input attributes.
@@ -572,7 +627,9 @@ processor: A function that processes a string (one record) and returns
 dynamic_padding_dimensions: If not empty, must be the same length as out.
     Specifies the 0-indexed dimension to pad dynamically for each output.
     The output is padded to the longest tensor in the batch along the dimension.
-    The first (0-th) dimension is _not_ the batch dimension.
+    The first (0-th) dimension is _not_ the batch dimension. A value of -1
+    indicates the specified output should not be padded, eg. if the output is a
+    scalar rather than a sequence.
 dynamic_padding_constants: Must be set if `dynamic_padding_dimension` is
     provided. The constant value to use for padding.
 )doc");

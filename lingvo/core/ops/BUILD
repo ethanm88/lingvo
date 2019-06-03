@@ -7,12 +7,13 @@ licenses(["notice"])  # Apache 2.0
 load(
     "//lingvo:lingvo.bzl",
     "custom_kernel_library",
+    "gen_op_cclib",
+    "gen_op_pylib",
     "lingvo_cc_library",
+    "lingvo_cc_test_library",
     "lingvo_cc_test",
     "lingvo_proto_cc",
     "lingvo_proto_py",
-    "gen_op_cclib",
-    "gen_op_pylib",
 )
 
 cc_library(
@@ -31,7 +32,9 @@ gen_op_pylib(
     name = "py_x_ops",
     srcs = ["py_x_ops.py"],
     cc_lib_name = "x_ops",
-    kernel_deps = [":op_kernels"],
+    kernel_deps = [
+        ":op_kernels",
+    ],
 )
 
 # Op kernel deps.
@@ -76,16 +79,33 @@ lingvo_cc_library(
     hdrs = ["simple_vocab.h"],
 )
 
+py_test(
+    name = "simple_vocab_test",
+    srcs = ["simple_vocab_test.py"],
+    python_version = "PY2",
+    deps = [
+        ":py_x_ops",
+        # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
+    ],
+)
+
 lingvo_cc_library(
     name = "record",
     srcs = [
+        "chain_record_yielder.cc",
         "record_batcher.cc",
         "record_debug.cc",
         "record_yielder.cc",
+        "sequential_record_yielder.cc",
+        "weighted_mix_record_yielder.cc",
     ],
     hdrs = [
+        "chain_record_yielder.h",
         "record_batcher.h",
         "record_yielder.h",
+        "sequential_record_yielder.h",
+        "weighted_mix_record_yielder.h",
     ],
     deps = [
         ":mutex",
@@ -99,6 +119,27 @@ lingvo_cc_test(
     deps = [
         ":input_common",
         ":record",
+        ":yielder_test_helper",
+    ],
+)
+
+lingvo_cc_test(
+    name = "weighted_mix_record_yielder_test",
+    srcs = ["weighted_mix_record_yielder_test.cc"],
+    deps = [
+        ":input_common",
+        ":record",
+        ":yielder_test_helper",
+    ],
+)
+
+lingvo_cc_test(
+    name = "chain_record_yielder_test",
+    srcs = ["chain_record_yielder_test.cc"],
+    deps = [
+        ":input_common",
+        ":record",
+        ":yielder_test_helper",
     ],
 )
 
@@ -113,7 +154,21 @@ lingvo_cc_test(
 
 lingvo_cc_library(
     name = "input_common",
+    srcs = ["input_common.cc"],
     hdrs = ["input_common.h"],
+    deps = [
+        ":record",
+    ],
+)
+
+lingvo_cc_test_library(
+    name = "yielder_test_helper",
+    srcs = [
+        "yielder_test_helper.cc",
+    ],
+    hdrs = [
+        "yielder_test_helper.h",
+    ],
     deps = [
         ":record",
     ],
@@ -130,9 +185,11 @@ custom_kernel_library(
 py_test(
     name = "assert_ops_test",
     srcs = ["assert_ops_test.py"],
+    python_version = "PY2",
     deps = [
         ":py_x_ops",
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -150,6 +207,7 @@ custom_kernel_library(
 py_test(
     name = "beam_search_step_op_test",
     srcs = ["beam_search_step_op_test.py"],
+    python_version = "PY2",
     deps = [
         ":hyps_py_pb2",
         ":py_x_ops",
@@ -157,6 +215,7 @@ py_test(
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -183,10 +242,12 @@ py_test(
     data = [
         "//lingvo/core/ops/testdata:best_step_testdata",
     ],
+    python_version = "PY2",
     deps = [
         ":py_x_ops",
         # Implicit tensorflow dependency.
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -202,12 +263,14 @@ custom_kernel_library(
 py_test(
     name = "functional_ops_test",
     srcs = ["functional_ops_test.py"],
+    python_version = "PY2",
     deps = [
         ":py_x_ops",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
         # Implicit tensorflow python framework_for_generated_wrappers dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -221,11 +284,14 @@ custom_kernel_library(
 py_test(
     name = "generic_input_op_test",
     srcs = ["generic_input_op_test.py"],
+    python_version = "PY2",
     deps = [
-        ":py_x_ops",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:generic_input",
+        "//lingvo/core:py_utils",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -241,10 +307,12 @@ custom_kernel_library(
 py_test(
     name = "random_ops_test",
     srcs = ["random_ops_test.py"],
+    python_version = "PY2",
     deps = [
         ":py_x_ops",
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -273,10 +341,12 @@ py_test(
         "//lingvo/core/ops/testdata:test_ngrams",
         "//lingvo/core/ops/testdata:test_vocab",
     ],
+    python_version = "PY2",
     deps = [
         ":py_x_ops",
         # Implicit tensorflow dependency.
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 

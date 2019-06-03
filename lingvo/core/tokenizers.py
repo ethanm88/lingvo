@@ -40,6 +40,8 @@ class BaseTokenizer(base_layer.BaseLayer):
     p.Define(
         'append_eos', True, 'Whether to append </s> at the end and treat '
         'it as a non-padded label.')
+    p.Define('pad_to_max_length', True,
+             'If True, output ids will be padded to max_length.')
     # TODO(ciprianchelba): there should be a check in __init__ that the ids
     # below are consistent with the ones assigned by the vocabulary.
     p.Define('target_unk_id', 0, 'Target unknown token id.')
@@ -56,7 +58,11 @@ class BaseTokenizer(base_layer.BaseLayer):
     self.eos_id = p.target_eos_id  # </S>
     self.unk_id = p.target_unk_id  # <UNK>
 
-  def StringsToIds(self, strs, max_length, external_append_eos=None):
+  def StringsToIds(self,
+                   strs,
+                   max_length,
+                   external_append_eos=None,
+                   languages=None):
     """Tokenize strs into vocab ids.
 
     Args:
@@ -65,6 +71,7 @@ class BaseTokenizer(base_layer.BaseLayer):
       external_append_eos: Bool or None. If None, will be ignored and
         `params.append_eos` will be used. If bool, will determine if an eos
         symbol will be added to tokens.
+      languages: A vector of strings with the same length as `strs`.
 
     Returns:
       A tuple (ids, labels, paddings) with the same shape [batch, maxlen].
@@ -83,26 +90,21 @@ class BaseTokenizer(base_layer.BaseLayer):
     else:
       append_eos = external_append_eos
 
-    ids, labels, paddings = self._StringsToIdsImpl(strs, max_length, append_eos)
-    if py_utils.use_tpu():
-      batch_size = strs.shape[0]
-      ids.set_shape([batch_size, max_length])
-      labels.set_shape([batch_size, max_length])
-      paddings.set_shape([batch_size, max_length])
-    return ids, labels, paddings
+    return self._StringsToIdsImpl(strs, max_length, append_eos, languages)
 
-  def _StringsToIdsImpl(self, strs, max_length, append_eos):
+  def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
     raise NotImplementedError('Abstract method.')
 
-  def IdsToStrings(self, ids, lens):
+  def IdsToStrings(self, ids, lens, languages=None):
     """Converts ids back to strings.
 
     Args:
       ids: A matrix of shape [batch, seqlen]. ids[i, :] is the i-th sample's
         ids.
       lens: A vector of shape [batch]. lens[i] is the sequence length of the
-        i-th sample. Only the first lens[i] tokens in ids[i, :] are valid
-        tokens for the i-th sequence.
+        i-th sample. Only the first lens[i] tokens in ids[i, :] are valid tokens
+        for the i-th sequence.
+      languages: A vector of strings of shape [batch].
 
     Returns:
       sequences - A vector of shape [batch]. The converted string sequence.
@@ -120,9 +122,13 @@ class AsciiTokenizer(BaseTokenizer):
   and punctuation symbols.
   """
 
-  def _StringsToIdsImpl(self, strs, max_length, append_eos):
+  def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
+    p = self.params
     return py_x_ops.ascii_to_token_id(
-        strs, maxlen=max_length, append_eos=append_eos)
+        strs,
+        maxlen=max_length,
+        pad_to_maxlen=p.pad_to_max_length,
+        append_eos=append_eos)
 
   def IdsToStrings(self, ids, lens):
     return py_x_ops.id_to_ascii(ids, lens)
@@ -142,6 +148,11 @@ class VocabFileTokenizer(BaseTokenizer):
              'string separator to use when joining ngrams.')
     p.Define('tokens_delimiter', ' ',
              'The delimiter to split a string to tokens with.')
+    p.Define(
+        'load_token_ids_from_vocab', True,
+        'Whether token ids are present in vocab (i.e. vocab contains two '
+        'colums, one for IDs and one for words).  If false, line numbers '
+        'are used.')
     return p
 
   @property
@@ -155,7 +166,7 @@ class VocabFileTokenizer(BaseTokenizer):
     if num_params_specified != 1:
       raise ValueError('Exactly one vocab file should be specified!')
 
-  def _StringsToIdsImpl(self, strs, max_length, append_eos):
+  def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
     self._CheckParams()
     p = self.params
 
@@ -163,8 +174,10 @@ class VocabFileTokenizer(BaseTokenizer):
       return py_x_ops.str_to_vocab_tokens(
           strs,
           maxlen=max_length,
+          pad_to_maxlen=p.pad_to_max_length,
           append_eos=append_eos,
           vocab_filepath=p.token_vocab_filepath,
+          load_token_ids_from_vocab=p.load_token_ids_from_vocab,
           delimiter=p.tokens_delimiter)
     elif p.ngram_vocab_filepath:
       raise NotImplementedError('ngram vocab StringsToIds is not supported.')
@@ -198,7 +211,7 @@ class BpeTokenizer(BaseTokenizer):
              'Specifies a filepath to the word bpe vocab file.')
     return p
 
-  def _StringsToIdsImpl(self, strs, max_length, append_eos):
+  def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
     p = self.params
 
     return py_x_ops.bpe_words_to_ids(
@@ -224,15 +237,12 @@ class WpmTokenizer(BaseTokenizer):
         'vocab_filepath', None,
         'Specifies a filepath to the WPM vocab. The vocab is sorted by '
         'descending merge score.')
-    p.Define('lowercase', False, 'Lowercase all text as a preprocessing step.')
     p.Define(
         'merge_prob', 1.,
         'Probability of merging WPMs. If less than 1, then decomposition '
         'of words into wordpieces will no longer be deterministic, and '
         'result in longer ID sequences. At 0, it will be graphemes.')
     return p
-
-  BOW_STR = b'\xe2\x96\x81'.decode('utf-8')
 
   @base_layer.initializer
   def __init__(self, params):
@@ -243,26 +253,19 @@ class WpmTokenizer(BaseTokenizer):
     assert p.target_sos_id == self._wpm_encoder.sentence_start_id
     assert p.target_eos_id == self._wpm_encoder.sentence_end_id
 
-  def _PadOrTruncate(self, x, desired_len, pad_value):
-    if len(x) > desired_len:
-      return x[:desired_len]
-    pad_len = desired_len - len(x)
-    return x + [pad_value] * pad_len
-
-  def _PostProcessIds(self, parsed_token_ids, desired_length, append_eos):
-    """Post-process token ids.
+  def _StringsToIdsImpl(self, strs, max_length, append_eos, languages):
+    """Takes a tensor of strings and returns id/padding tensors.
 
     This generates `token_ids`, `target_ids`, and `paddings` in the format that
     is expected for tokenizers. This performs padding to a fixed length and
     appends the end-of-sentence token as appropriate.
 
     Args:
-      parsed_token_ids: a list of vectors of token ids. The vectors have
-        variable length.
-      desired_length: a python integer. The second dimension of the
-        returned arrays. All sequences are padded or truncated to that
-        length.
+      strs: a string Tensor.
+      max_length: a python integer. The second dimension of the returned arrays.
+        All sequences are padded or truncated to that length.
       append_eos: a python bool. See `BaseTokenizer` for explanation.
+      languages: A vector of strings with the same length as `strs`.
 
     Returns:
       token_ids: a tensor of sequences of WPM ids starting with SOS. Sequences
@@ -273,69 +276,65 @@ class WpmTokenizer(BaseTokenizer):
       paddings: a tensor of floats indicating, at each position, whether
         the corresponding position is padded.
     """
+    p = self.params
     if append_eos is None:
-      append_eos = self.params.append_eos
-    token_ids, target_ids, paddings = [], [], []
-    for ids in parsed_token_ids:
-      ids = list(ids)  # It was a tuple.
+      append_eos = p.append_eos
+
+    batch_size = py_utils.GetShape(strs)[0]
+    token_ids_ta = tf.TensorArray(tf.int32, batch_size)
+    target_ids_ta = tf.TensorArray(tf.int32, batch_size)
+    paddings_ta = tf.TensorArray(tf.float32, batch_size)
+
+    def _TokenizeOneSentence(i, strs, token_ids_ta, target_ids_ta, paddings_ta):
+      """Tokenizes a single sentence."""
+      ids, _ = self._wpm_encoder.Encode(strs[i])
+
       if append_eos:
-        ids += [self.eos_id]
+        ids = tf.concat([ids, [self.eos_id]], axis=0)
+
       # This truncates after the eos is added, so some sentences might
       # not have </s> at the end.
-      token_ids += [
-          self._PadOrTruncate([self.sos_id] + ids, desired_length, self.eos_id)
-      ]
-      target_ids += [self._PadOrTruncate(ids, desired_length, self.eos_id)]
-      paddings += [self._PadOrTruncate([0.] * len(ids), desired_length, 1.)]
-    token_ids = np.matrix(token_ids)
-    target_ids = np.matrix(target_ids)
-    paddings = np.matrix(paddings, dtype=np.float32)
-    assert token_ids.shape == target_ids.shape, (
-        'Shapes mismatch: %s vs %s' % (token_ids.shape, target_ids.shape))
-    assert token_ids.shape == paddings.shape, (
-        'Shapes mismatch: %s vs %s' % (token_ids.shape, paddings.shape))
-    assert token_ids.shape[1] == desired_length, (
-        'Length mismatch: %s vs %s' % (token_ids.shape[1], desired_length))
-    return [token_ids, target_ids, paddings]
+      token_ids_ta = token_ids_ta.write(
+          i,
+          py_utils.PadOrTrimTo(
+              tf.concat([[self.sos_id], ids], axis=0), [max_length],
+              self.eos_id))
+      target_ids_ta = target_ids_ta.write(
+          i, py_utils.PadOrTrimTo(ids, [max_length], self.eos_id))
+      paddings_ta = paddings_ta.write(
+          i,
+          py_utils.PadOrTrimTo(
+              tf.zeros_like(ids, dtype=tf.float32), [max_length], 1.))
 
-  def _WpmEncode(self, batch_strs, max_length, append_eos):
-    """By word so that merge_prob is applied correctly."""
-    token_ids = []
-    for sentence in batch_strs:
-      if sentence:
-        if self.params.lowercase:
-          sentence = sentence.lower()
-        words = sentence.split(' ')
-        sent_ids = []
-        for w in words:
-          w = self.BOW_STR + w
-          _, encoded_ids = zip(*self._wpm_encoder.EncodeToStringAndIds(w))
-          sent_ids += encoded_ids
-        token_ids += [sent_ids]
-      else:
-        token_ids += [[]]
-    return self._PostProcessIds(token_ids, max_length, append_eos)
+      return i + 1, strs, token_ids_ta, target_ids_ta, paddings_ta
 
-  def _StringsToIdsImpl(self, strs, max_length, append_eos):
-    """Takes a tensor of strings and returns id/padding tensors."""
-    ids, labels, paddings = tf.py_func(self._WpmEncode,
-                                       [strs, max_length, append_eos],
-                                       [tf.int64, tf.int64, tf.float32])
-    return [tf.to_int32(ids), tf.to_int32(labels), paddings]
+    _, _, token_ids_ta, target_ids_ta, paddings_ta = tf.while_loop(
+        lambda i, *_: i < batch_size,
+        _TokenizeOneSentence,
+        loop_vars=(tf.constant(0, tf.int32), strs, token_ids_ta, target_ids_ta,
+                   paddings_ta),
+        parallel_iterations=30,
+        back_prop=False)
 
-  def _WpmDecode(self, ids, lengths):
-    """Takes numpy integer matrices and returns vectors of strings."""
-    assert len(ids) == len(lengths)
-    strs = []
-    for k in range(len(ids)):
-      i = ids[k][:lengths[k]]
-      wpm_str = self._wpm_encoder.Decode(i)
-      txt = ''.join(wpm_str).replace(self.BOW_STR, ' ')
-      # Remove the first space that's inserted in front of each word.
-      txt = txt.lstrip(' ')
-      strs += [txt]
-    return [strs]
+    token_ids = token_ids_ta.stack()
+    target_ids = target_ids_ta.stack()
+    paddings = paddings_ta.stack()
+
+    if not p.pad_to_max_length:
+      maxlen = tf.to_int32(tf.reduce_max(tf.reduce_sum(1.0 - paddings, axis=1)))
+      token_ids = token_ids[:, :maxlen]
+      target_ids = target_ids[:, :maxlen]
+      paddings = paddings[:, :maxlen]
+
+    return token_ids, target_ids, paddings
 
   def IdsToStrings(self, ids, lens):
-    """Takes id tensors and returns vector of `tf.string`s."""
-    return tf.py_func(self._WpmDecode, [ids, lens], tf.string)
+    """Takes integer matrices and returns vectors of strings."""
+    ids = py_utils.with_dependencies([py_utils.assert_same_dim0([ids, lens])],
+                                     ids)
+    return tf.map_fn(
+        lambda inputs: self._wpm_encoder.Decode(inputs[0][:inputs[1]]),
+        (ids, lens),
+        dtype=tf.string,
+        parallel_iterations=30,
+        back_prop=False)

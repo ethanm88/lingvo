@@ -27,7 +27,6 @@ import tarfile
 
 import tensorflow as tf
 
-from lingvo.core import asr_frontend
 from lingvo.tools import audio_lib
 
 tf.flags.DEFINE_string('input_tarball', '', 'Input .tar.gz file.')
@@ -70,7 +69,7 @@ def _MakeTfExample(uttid, frames, text):
   flat_frames = frames.flatten()
   feature = {
       'uttid': _MakeBytesFeature([uttid]),
-      'transcript': _MakeBytesFeature([text]),
+      'transcript': _MakeBytesFeature([text.lower()]),
       'frames': _MakeFloatFeature(flat_frames)
   }
   return tf.train.Example(features=tf.train.Features(feature=feature))
@@ -141,38 +140,6 @@ def _MakeLogMelFromTensorflowBuiltin(tf_wav_bytes):
   return log_mel
 
 
-def _CreateAsrFrontend():
-  p = asr_frontend.MelFrontend.Params()
-  p.sample_rate = 16000.
-  p.frame_size_ms = 25.
-  p.frame_step_ms = 10.
-  p.num_bins = 80
-  p.lower_edge_hertz = 125.
-  p.upper_edge_hertz = 7600.
-  p.preemph = 0.97
-  p.noise_scale = 0.
-  p.pad_end = False
-  # Stack 3 frames and sub-sample by a factor of 3.
-  p.left_context = 2
-  p.output_stride = 3
-  return p.cls(p)
-
-
-def _MakeLogMel(tf_wav_bytes):
-  sample_rate, audio = audio_lib.DecodeWav(tf_wav_bytes)
-  audio *= 32768
-  # Remove channel dimension, since we have a single channel.
-  audio = tf.squeeze(audio, axis=1)
-  # TODO(drpng): make batches.
-  audio = tf.expand_dims(audio, axis=0)
-  static_sample_rate = 16000
-  mel_frontend = _CreateAsrFrontend()
-  with tf.control_dependencies(
-      [tf.assert_equal(sample_rate, static_sample_rate)]):
-    log_mel, _ = mel_frontend.FPropDefaultTheta(audio)
-  return log_mel
-
-
 def _OpenSubShards():
   tf.logging.info('Shards: %d to %d', FLAGS.output_range_begin,
                   FLAGS.output_range_end)
@@ -203,7 +170,7 @@ def _CreateAsrFeatures():
     trans = _ReadTranscriptions()
   tf.logging.info('Total transcripts: %d', len(trans))
   tf_bytes = tf.placeholder(dtype=tf.string)
-  log_mel = _MakeLogMel(tf_bytes)
+  log_mel = audio_lib.ExtractLogMelFeatures(tf_bytes)
   # Second pass: transcode the flac.
   tar = tarfile.open(FLAGS.input_tarball, mode='r:gz')
   n = 0

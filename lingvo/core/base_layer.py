@@ -26,6 +26,7 @@ import tensorflow as tf
 from lingvo.core import cluster_factory
 from lingvo.core import hyperparams
 from lingvo.core import py_utils
+from lingvo.core import symbolic
 
 
 class _LocalLayerStack(threading.local):
@@ -106,13 +107,18 @@ def initializer(func):  # pylint: disable=invalid-name
     func: The __init__ method of `BaseLayer`'s subclasses.
 
   Returns:
-    A decorator wrapper for layer's initializer.
+    A decorator wrapper for layer's initializer. Note that this wrapper can
+    be called multiple times for the same layer instance, once for each
+    __init__() for classes on the class hierarchy.
   """
 
   def wrapper(self, *args, **kwargs):  # pylint: disable=invalid-name
     # Push back self (the current layer) to the stack.
     stack = _LAYER_STACK.layer_stack
-    stack.append(self)
+    should_pop = False
+    if not stack or stack[-1] is not self:
+      stack.append(self)
+      should_pop = True
     try:
       # Calls the layer's real __init__ method.
       func(self, *args, **kwargs)
@@ -124,7 +130,8 @@ def initializer(func):  # pylint: disable=invalid-name
         stack[-2]._AutoAddChild(self)
     finally:
       # Pop out self (the current layer).
-      stack.pop()
+      if should_pop:
+        stack.pop()
 
   return wrapper
 
@@ -135,11 +142,19 @@ def DefaultVN():
 
 def RecursiveFindLayerParams(params):
   """Returns all params that define a layer."""
+  if not isinstance(params, hyperparams.Params):
+    return []
   layer_params = []
   if hasattr(params, 'cls') and issubclass(params.cls, BaseLayer):
     layer_params.append(params)
   for _, p in params.IterParams():
-    if isinstance(p, hyperparams.Params):
+    if isinstance(p, (list, tuple)):
+      for item in p:
+        layer_params.extend(RecursiveFindLayerParams(item))
+    elif isinstance(p, dict):
+      for item in p.items():
+        layer_params.extend(RecursiveFindLayerParams(item))
+    else:
       layer_params.extend(RecursiveFindLayerParams(p))
   return layer_params
 
@@ -157,8 +172,7 @@ class BaseLayer(object):
   @classmethod
   def Params(cls):
     """Returns the layer params."""
-    p = hyperparams.Params()
-    p.Define('cls', cls, 'Cls that this param object is associated with.')
+    p = hyperparams.InstantiableParams(cls)
     p.Define('inference_driver_name', cls._INFERENCE_DRIVER_NAME,
              'Name of the inference driver used to construct this layer.')
     p.Define('name', '', 'Name of this layer object.')
@@ -181,7 +195,6 @@ class BaseLayer(object):
     p.Define('is_inference', None, 'True if in inference mode.')
     # In addition to is_eval/is_inference, indicate that the inference graph is
     # for a single step.
-    p.Define('per_step_infer', False, 'True if in per-step inference mode.')
     p.Define(
         'allow_implicit_capture', None,
         'When using Defuns, code often asserts that the Defun does not '
@@ -189,9 +202,12 @@ class BaseLayer(object):
         'at the expense of making some kinds of models or utilities '
         'hard/impossible to use. Setting this to True/False (versus None) '
         'causes the setting to apply to this layer and its children.')
-
-    # DEPRECATED params
-    p.Define('add_summary', True, 'DEPRECATED. Moved to Cluster.')
+    p.Define(
+        'skip_lp_regularization', None,
+        'If True, all variables in this layer will skip Lp regularization. '
+        'If None/False, only variables explicitly in the '
+        'SKIP_LP_REGULARIZATION collection will skip Lp regularization. '
+        'Also propagated to child layers with default settings (None).')
     return p
 
   @staticmethod
@@ -212,6 +228,8 @@ class BaseLayer(object):
       to_params.is_inference = from_params.is_inference
     if to_params.allow_implicit_capture is None:
       to_params.allow_implicit_capture = from_params.allow_implicit_capture
+    if to_params.skip_lp_regularization is None:
+      to_params.skip_lp_regularization = from_params.skip_lp_regularization
 
     # Only copy from base when vn config is using the default setting.
     if to_params.vn == DefaultVN():
@@ -236,6 +254,10 @@ class BaseLayer(object):
     """
     assert params.name, (
         'Layer params for %s must have a "name"' % self.__class__.__name__)
+    self._parent = (
+        _LAYER_STACK.layer_stack[-2]
+        if len(_LAYER_STACK.layer_stack) > 1 else None)
+    assert self._parent is not self
     self._params = params.Copy()
     tf.logging.debug('Creating layer %s with params: \n %s \n',
                      self.__class__.__name__, str(params))
@@ -256,6 +278,12 @@ class BaseLayer(object):
     self._private_accumulators = py_utils.NestedMap()
     # Layer-private functions. Add with AddFunction.
     self._private_fns = dict()
+    # Mapping from variable names to its symbolic shape.
+    # self._var_symbolic_shape_map['var_name'] will be a tuple of integers or
+    # symbolic expressions, one for each dimension of the variable.
+    self._var_symbolic_shape_map = dict()
+
+    self.AddExtraTheta('global_step', py_utils.GetGlobalStep())
 
   def FPropDefaultTheta(self, *args, **kwargs):
     """Calls `FProp`."""
@@ -302,11 +330,11 @@ class BaseLayer(object):
     E.g.::
 
         p = SomeComplexLayer.Params()
-        meta = p.cls.FPropMeta(p, tf.TensorShape([128, 20, 50, 32]))
+        meta = p.cls.FPropMeta(p, tshape.Shape([128, 20, 50, 'channels']))
 
     `meta.flops` gives an estimate count of floating point operations done by
-    one `FProp` given an input tensor of shape [128, 20, 50, 32].
-    `meta.out_shapes` is a tuple of tensor shapes, which tells you what shape
+    one `FProp` given an input tensor of shape [128, 20, 50, channels].
+    `meta.out_shapes` is a tuple of TShape, which tells you what shape
     of tensors this layer will return.
 
     Args:
@@ -319,7 +347,7 @@ class BaseLayer(object):
 
       - flops - The estimated number of floating point operations incurred by
         this fprop.
-      - out_shapes - A tuple of `tf.TensorShape`. I.e., `out_shapes[i]`
+      - out_shapes - A tuple of `TShape`. I.e., `out_shapes[i]`
         represents the shape of the `i`-th returned tensor of the fprop.
     """
     raise NotImplementedError('FPropMeta of %s' % cls)
@@ -333,6 +361,19 @@ class BaseLayer(object):
   def cluster(self):
     """Returns the current cluster configuration."""
     return cluster_factory.Current()
+
+  @property
+  def parent(self):
+    """None if self is the root layer, otherwise the parent layer of self."""
+    return self._parent
+
+  @property
+  def path(self):
+    """Returns a '.'-separated string with all layer names from the root."""
+    if self.parent:
+      return self.parent.path + '.' + self.params.name
+    else:
+      return self.params.name
 
   @property
   def children(self):
@@ -351,6 +392,26 @@ class BaseLayer(object):
     else:
       raise AttributeError('%s is not a sub-layer of %s.' % (name, self))
 
+  def GetDescendant(self, path):
+    """Returns a descendant layer given the path.
+
+    Args:
+      path: a comma separated string denoting a descendant of this layer.
+
+    Returns:
+      The descendant layer.
+
+    Raises:
+      KeyError: if the descendant is not found.
+    """
+    sub = self
+    if path:
+      for k in path.split('.'):
+        if k not in sub.children:
+          raise KeyError('%s not found in %s' % (k, sub.children.keys()))
+        sub = sub.children[k]
+    return sub
+
   @property
   def vars(self):
     """Returns variables of this layer and its children in a `.NestedMap`."""
@@ -363,24 +424,21 @@ class BaseLayer(object):
   def theta(self):
     """Returns theta of this layer and its children in a `.NestedMap`."""
     ret = self._private_children.Transform(lambda x: x.theta)
-    should_cast = (
-        self._params.fprop_dtype is not None and
-        self._params.fprop_dtype != self._params.dtype)
-    if should_cast:
 
-      def _DoCast(x, fprop_dtype):
-        if x.dtype != fprop_dtype:
-          return tf.cast(x, fprop_dtype)
+    private_theta = self._private_theta
+
+    if (self._params.fprop_dtype is not None and
+        self._params.fprop_dtype != self._params.dtype):
+
+      def MaybeCastToFPropDtype(x):
+        if x.dtype == self._params.dtype:
+          return tf.cast(x, self._params.fprop_dtype)
         else:
           return x
 
-      private_theta = self._private_theta.Transform(
-          lambda x: _DoCast(x, self._params.fprop_dtype))
-    else:
-      private_theta = self._private_theta
+      private_theta = private_theta.Transform(MaybeCastToFPropDtype)
 
-    for k in private_theta.keys():
-      ret[k] = private_theta[k]
+    ret.update(private_theta)
     return ret
 
   @property
@@ -475,7 +533,7 @@ class BaseLayer(object):
 
     Then, typically in `PostTrainingStepUpdate`::
 
-        acc = self.accumulator.mytracker.GetValue()
+        acc = self.accumulator.mytracker
         acc_value = acc.GetValue()
         # Do something with the value.
         acc.Reset()
@@ -507,6 +565,10 @@ class BaseLayer(object):
     for acc, value in zip(accumulator_list, value_list):
       acc.SetValue(value)
 
+  def GetVariableSymbolicShape(self, var_name):
+    """Returns the variable's symbolic shape."""
+    return self._var_symbolic_shape_map.get(var_name, None)
+
   def CreateVariable(self, name, var_params, theta_fn=None, *args, **kwargs):
     """Create a variable of this layer according to the parameter `var_params`.
 
@@ -537,6 +599,18 @@ class BaseLayer(object):
       **kwargs: Keyword args passed to `.py_utils.CreateVariable`.
     """
     self._CheckName(name)
+    if (self.params.skip_lp_regularization and
+        py_utils.SKIP_LP_REGULARIZATION not in var_params.collections):
+      var_params = py_utils.WeightParams(
+          shape=var_params.shape,
+          dtype=var_params.dtype,
+          init=var_params.init,
+          collections=(var_params.collections +
+                       [py_utils.SKIP_LP_REGULARIZATION]))
+    self._var_symbolic_shape_map[name] = var_params.shape
+    if (var_params.shape and
+        any(symbolic.IsExpr(dim) for dim in var_params.shape)):
+      var_params.shape = symbolic.EvalExpr(var_params.shape)
     value, var = py_utils.CreateVariable(name, var_params, *args, **kwargs)
     self._private_vars[name] = var
     if theta_fn is not None:
@@ -573,10 +647,10 @@ class BaseLayer(object):
     if not params.name:
       params.name = name
     p = self.CopyBaseParams(self.params, params.Copy())
-    child = p.cls(p)
+    child = p.Instantiate()
     self._private_children[name] = child
 
-  def CreateChildren(self, name, params_list):
+  def CreateChildren(self, name, params_list, child_scopes=None):
     """Create a list of sub layers.
 
     The created sub layer list can be accessed by `name`. E.g.::
@@ -593,22 +667,33 @@ class BaseLayer(object):
       name: The name for the sub layers, which is used as the key
         into vars/theta.
       params_list: `Hyperparams` objects to instantiate a list of layers.
+      child_scopes: If not none, a variable_scope to set for each child.
     """
     self._CheckName(name)
 
-    def CreateChildrenHelper(params_list):
+    def CreateChildrenHelper(params_list, child_scopes):
+      """Helper to create children recursively."""
+      if child_scopes and len(child_scopes) != len(params_list):
+        raise ValueError('child_scopes must be same structure as params_list.')
       children = []
       for i, p in enumerate(params_list):
         if isinstance(p, list):
-          children.append(CreateChildrenHelper(p))
+          children.append(
+              CreateChildrenHelper(p,
+                                   child_scopes[i] if child_scopes else None))
         else:
           p = self.CopyBaseParams(self.params, p.Copy())
           if not p.name:
             p.name = '%s_%d' % (name, i)
-          children.append(p.cls(p))
+          if child_scopes:
+            with tf.variable_scope(child_scopes[i]):
+              children.append(p.Instantiate())
+          else:
+            children.append(p.Instantiate())
       return children
 
-    self._private_children[name] = CreateChildrenHelper(params_list)
+    self._private_children[name] = CreateChildrenHelper(params_list,
+                                                        child_scopes)
 
   def AddChild(self, name, child):
     """Add an existing layer as a sublayer."""
@@ -690,3 +775,8 @@ class BaseLayer(object):
         for child in self._private_children.Flatten()
     ]
     return tf.group(*update_ops)
+
+
+def IsLayerParams(x):
+  return (isinstance(x, hyperparams.InstantiableParams) and
+          issubclass(x.cls, BaseLayer))

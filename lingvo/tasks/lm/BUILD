@@ -16,9 +16,9 @@ py_library(
     deps = [
         # Implicit tensorflow dependency.
         "//lingvo/core:base_input_generator",
+        "//lingvo/core:generic_input",
         "//lingvo/core:py_utils",
         "//lingvo/core:tokenizers",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
@@ -28,10 +28,12 @@ py_test(
     data = [
         "//lingvo/tasks/lm/testdata:lm1b_100",
     ],
+    python_version = "PY2",
     deps = [
         ":input_generator",
         # Implicit tensorflow dependency.
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -44,6 +46,7 @@ py_library(
         "//lingvo/core:base_layer",
         "//lingvo/core:layers",
         "//lingvo/core:layers_with_attention",
+        "//lingvo/core:layers_with_gpipe",
         "//lingvo/core:py_utils",
         "//lingvo/core:rnn_cell",
         "//lingvo/core:rnn_layers",
@@ -74,8 +77,8 @@ py_library(
         # Implicit tensorflow dependency.
         "//lingvo/core:base_layer",
         "//lingvo/core:base_model",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
     ],
 )
 
@@ -86,6 +89,7 @@ py_test(
         "//lingvo/tasks/lm/testdata:lm1b_100",
         "//lingvo/tasks/lm/testdata:small_word_vocab",
     ],
+    python_version = "PY2",
     deps = [
         ":input_generator",
         ":model",

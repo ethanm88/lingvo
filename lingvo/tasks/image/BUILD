@@ -15,22 +15,25 @@ py_library(
         "//lingvo/core:base_layer",
         "//lingvo/core:base_model",
         "//lingvo/core:layers",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:metrics",
         "//lingvo/core:plot",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
     ],
 )
 
 py_test(
     name = "classifier_test",
     srcs = ["classifier_test.py"],
+    python_version = "PY2",
     deps = [
         ":classifier",
         ":input_generator",
+        # Implicit numpy dependency.
         # Implicit tensorflow dependency.
         "//lingvo:model_registry",
         "//lingvo/core:cluster_factory",
+        "//lingvo/core:layers",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
         "//lingvo/tasks/image/params:mnist",
@@ -51,10 +54,12 @@ py_library(
 py_test(
     name = "input_generator_test",
     srcs = ["input_generator_test.py"],
+    python_version = "PY2",
     deps = [
         ":input_generator",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )

@@ -21,13 +21,13 @@ from __future__ import print_function
 import os
 
 import tensorflow as tf
-
 from lingvo.core import early_stop
 from lingvo.core import hyperparams
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 
 
-class MetricHistoryTest(tf.test.TestCase):
+class MetricHistoryTest(test_utils.TestCase):
 
   def setUp(self):
     early_stop.MetricHistory._metric_histories_map = {}
@@ -77,18 +77,18 @@ class MetricHistoryTest(tf.test.TestCase):
 
     self.assertTrue(tf.gfile.Exists(mh1.hist_file))
     self.assertTrue(tf.gfile.Exists(mh2.hist_file))
-    with tf.gfile.FastGFile(mh1.hist_file) as f:
+    with tf.gfile.GFile(mh1.hist_file) as f:
       lines = f.readlines()
       self.assertEqual(len(lines), 2)
       self.assertEqual(lines[0].rstrip(), '1 10.000000')
       self.assertEqual(lines[1].rstrip(), '2 5.000000')
-    with tf.gfile.FastGFile(mh2.hist_file) as f:
+    with tf.gfile.GFile(mh2.hist_file) as f:
       lines = f.readlines()
       self.assertEqual(len(lines), 1)
       self.assertEqual(lines[0].rstrip(), '1 10.000000')
 
 
-class EarlyStopTest(tf.test.TestCase):
+class EarlyStopTest(test_utils.TestCase):
 
   def testEarlyStopDefaultIsNoOp(self):
     p = early_stop.EarlyStop.Params()

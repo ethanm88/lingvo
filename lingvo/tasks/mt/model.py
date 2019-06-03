@@ -23,10 +23,8 @@ import tensorflow as tf
 
 from lingvo.core import base_layer
 from lingvo.core import base_model
-from lingvo.core import cluster_factory
 from lingvo.core import metrics
 from lingvo.core import py_utils
-from lingvo.core import summary_utils
 from lingvo.tasks.mt import decoder
 from lingvo.tasks.mt import encoder
 
@@ -61,11 +59,9 @@ class MTBaseModel(base_model.BaseTask):
 
   def ComputePredictions(self, theta, batch):
     with self._EncoderDevice():
-      src_enc, src_enc_paddings, src_segment_ids = self.enc.FProp(
-          theta.enc, batch.src)
+      encoder_outputs = self.enc.FProp(theta.enc, batch.src)
     with self._DecoderDevice():
-      return self.dec.ComputePredictions(theta.dec, src_enc, src_enc_paddings,
-                                         batch.tgt, src_segment_ids)
+      return self.dec.ComputePredictions(theta.dec, encoder_outputs, batch.tgt)
 
   def ComputeLoss(self, theta, batch, predictions):
     with self._DecoderDevice():
@@ -80,8 +76,8 @@ class MTBaseModel(base_model.BaseTask):
   def _BeamSearchDecode(self, input_batch):
     p = self.params
     with tf.name_scope('fprop'), tf.name_scope(p.name):
-      src_enc, src_enc_paddings, _ = self.enc.FPropDefaultTheta(input_batch.src)
-      decoder_outs = self.dec.BeamSearchDecode(src_enc, src_enc_paddings)
+      encoder_outputs = self.enc.FPropDefaultTheta(input_batch.src)
+      decoder_outs = self.dec.BeamSearchDecode(encoder_outputs)
 
       topk_hyps = decoder_outs.topk_hyps
       topk_ids = decoder_outs.topk_ids
@@ -184,21 +180,17 @@ class TransformerModel(MTBaseModel):
     p = self.params
     assert p.encoder.model_dim == p.decoder.source_dim
 
-  def BProp(self):
-    super(TransformerModel, self).BProp()
-    # Computes gradients' norm and adds their summaries.
-    p = self.params
-    vg = self._var_grads
-    emb_vg = py_utils.NestedMap()
-    emb_vg.child = [vg.enc.token_emb, vg.dec.token_emb]
 
-    # Note that positional embedding layer has no trainable variable
-    # if its trainable_scaling is false.
-    if 'position_emb' in vg.enc:
-      emb_vg.child += [vg.enc.position_emb]
-    if 'position_emb' in vg.dec:
-      emb_vg.child += [vg.dec.position_emb]
-    summary_utils.AddNormSummary('emb', emb_vg)
-    summary_utils.AddNormSummary('atten',
-                                 [vg.enc.transformer_stack.trans, vg.dec.trans])
-    summary_utils.AddNormSummary('softmax', vg.dec.softmax)
+class RNMTModel(MTBaseModel):
+  """RNMT+ Model.
+
+  Implements RNMT Variants in The Best of Both Worlds paper:
+  https://aclweb.org/anthology/P18-1008
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(RNMTModel, cls).Params()
+    p.encoder = encoder.MTEncoderBiRNN.Params()
+    p.decoder = decoder.MTDecoderV1.Params()
+    return p

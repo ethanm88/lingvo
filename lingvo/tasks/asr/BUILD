@@ -5,6 +5,34 @@ package(
 licenses(["notice"])  # Apache 2.0
 
 py_library(
+    name = "frontend",
+    srcs = ["frontend.py"],
+    deps = [
+        # Implicit tensorflow dependency.
+        "//lingvo/core:base_layer",
+        "//lingvo/core:py_utils",
+    ],
+)
+
+py_test(
+    name = "frontend_test",
+    srcs = ["frontend_test.py"],
+    data = [
+        "//lingvo/tools/testdata:audio_data",
+    ],
+    python_version = "PY2",
+    deps = [
+        ":frontend",
+        # Additional FFT kernels dependency.
+        # Implicit numpy dependency.
+        # Implicit tensorflow dependency.
+        "//lingvo/core:py_utils",
+        "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
+    ],
+)
+
+py_library(
     name = "input_generator",
     srcs = ["input_generator.py"],
     deps = [
@@ -12,22 +40,22 @@ py_library(
         # Implicit tensorflow dependency.
         "//lingvo/core:base_input_generator",
         "//lingvo/core:base_layer",
+        "//lingvo/core:generic_input",
         "//lingvo/core:py_utils",
         "//lingvo/core:tokenizers",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
 py_test(
     name = "input_generator_test",
     srcs = ["input_generator_test.py"],
+    python_version = "PY2",
     deps = [
         ":input_generator",
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
-        "//lingvo/core:py_utils",
-        "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -44,6 +72,7 @@ py_library(
         "//lingvo/core:plot",
         "//lingvo/core:py_utils",
         "//lingvo/core:rnn_cell",
+        "//lingvo/core:spectrum_augmenter",
         "//lingvo/core:summary_utils",
     ],
 )
@@ -51,6 +80,7 @@ py_library(
 py_test(
     name = "encoder_test",
     srcs = ["encoder_test.py"],
+    python_version = "PY2",
     deps = [
         ":encoder",
         # Implicit numpy dependency.
@@ -84,9 +114,11 @@ py_library(
 py_test(
     name = "decoder_utils_test",
     srcs = ["decoder_utils_test.py"],
+    python_version = "PY2",
     deps = [
         ":decoder_utils",
         # Implicit tensorflow dependency.
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -105,18 +137,19 @@ py_library(
         ":contextualizer_base",
         ":decoder_utils",
         ":fusion",
+        # Implicit matplotlib dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:attention",
         "//lingvo/core:base_decoder",
         "//lingvo/core:base_layer",
+        "//lingvo/core:cluster_factory",
         "//lingvo/core:layers",
         "//lingvo/core:plot",
         "//lingvo/core:py_utils",
         "//lingvo/core:recurrent",
         "//lingvo/core:rnn_cell",
         "//lingvo/core:summary_utils",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
@@ -124,6 +157,7 @@ py_test(
     name = "decoder_test",
     size = "large",
     srcs = ["decoder_test.py"],
+    python_version = "PY2",
     shard_count = 10,
     deps = [
         ":decoder",
@@ -131,6 +165,8 @@ py_test(
         # Implicit numpy dependency.
         # Implicit six dependency.
         # Implicit tensorflow dependency.
+        "//lingvo/core:cluster_factory",
+        "//lingvo/core:layers",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
         "//lingvo/core/ops:hyps_py_pb2",
@@ -154,22 +190,27 @@ py_library(
         ":decoder",
         ":decoder_utils",
         ":encoder",
+        ":frontend",
         # Implicit six dependency.
         # Implicit tensorflow dependency.
         "//lingvo/core:base_layer",
         "//lingvo/core:base_model",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:metrics",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
+        "//lingvo/tools:audio_lib",
     ],
 )
 
 py_test(
     name = "model_test",
     srcs = ["model_test.py"],
+    data = ["//lingvo/tools/testdata:audio_data"],
+    python_version = "PY2",
     shard_count = 15,
     deps = [
         ":decoder",
+        ":input_generator",
         ":model",
         ":model_test_input_generator",
         # Implicit numpy dependency.
@@ -177,9 +218,10 @@ py_test(
         # Implicit tensorflow dependency.
         "//lingvo/core:base_layer",
         "//lingvo/core:cluster_factory",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
         "//lingvo/core:summary_utils",
+        "//lingvo/core:test_helper",
         "//lingvo/core:test_utils",
     ],
 )
