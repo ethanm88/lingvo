@@ -596,7 +596,9 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     target_weights_sum = tf.reduce_sum(target_weights)
     # add 0.000001 to avoid divide-by-zero.
     target_weights_sum_eps = target_weights_sum + 0.000001
-    # add something
+    # add loss
+    target_weights_batch = tf.reduce_sum(target_weights, 1)
+    target_weights_batch_eps = target_weights_batch + 0.000001
     if not py_utils.use_tpu():
       correct_preds = tf.cast(
           tf.equal(tf.argmax(logits, 2, output_type=tf.int32), target_labels),
@@ -613,6 +615,8 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
       per_example_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
           labels=target_labels, logits=logits)
     per_sequence_loss = tf.reduce_sum(per_example_loss * target_weights, 1)
+    per_example_batch = per_sequence_loss/target_weights_batch_eps
+
     per_token_avg_loss = (
         tf.reduce_sum(per_sequence_loss) / target_weights_sum_eps)
     if p.per_token_avg_loss:
@@ -621,6 +625,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     else:  # per-sequence average loss
       loss = tf.reduce_mean(per_sequence_loss)
       loss_weight = tf.shape(per_sequence_loss)[0]
+    tf.add_to_collection('per_loss', per_example_batch)
     metrics = {
         'loss': (loss, loss_weight),
         # add log_pplx for compatibility with the mt/decoder.py
