@@ -596,6 +596,7 @@ class AsrDecoderBase(base_decoder.BaseBeamSearchDecoder):
     target_weights_sum = tf.reduce_sum(target_weights)
     # add 0.000001 to avoid divide-by-zero.
     target_weights_sum_eps = target_weights_sum + 0.000001
+    # add something
     if not py_utils.use_tpu():
       correct_preds = tf.cast(
           tf.equal(tf.argmax(logits, 2, output_type=tf.int32), target_labels),
