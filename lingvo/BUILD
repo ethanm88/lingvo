@@ -127,6 +127,7 @@ py_library(
         "//lingvo/core:inference_graph_exporter",
         "//lingvo/core:metrics",
         "//lingvo/core:py_utils",
+        "//lingvo/core:asr_frontend",
     ],
 )
 
