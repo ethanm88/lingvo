@@ -1,5 +1,7 @@
 # Lingvo
 
+Tensorflow 1.13.1 is supported by this branch of Lingvo system and Tensorflow 1.14 is not supported.
+
 ## What is it?
 
 Lingvo is a toolkit for building neural networks in Tensorflow, particularly
